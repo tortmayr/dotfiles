@@ -7,13 +7,16 @@ export ZSH_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zsh"
 # Shell libraries shipped alongside these dotfiles (worktree.sh, git.sh).
 export SCRIPT_LIBRARY_DIR="$ZDOTDIR/lib"
 
-# Root that `sgit` / `cgit` scan for git repositories. Overridden in host.d
-# where repositories do not live under $HOME (an enclave container mirrors the
-# host's absolute paths, so $HOME/Git is empty there).
-export USER_GIT_DIR="${USER_GIT_DIR:-$HOME/Git}"
+# USER_GIT_DIR — the root `sgit` / `cgit` scan for repositories — is owned by
+# the machine layer and deliberately not defaulted here. This file runs before
+# host.d, so a default set here would already be non-empty by the time an
+# overlay tries its own `${USER_GIT_DIR:-...}`, and the overlay would silently
+# lose. $HOME/Git is also simply wrong wherever repositories are not below the
+# local home, such as a container that mirrors the host's absolute paths.
+# git.sh keeps a $HOME/Git fallback for the case where no layer sets it.
 
-# EDITOR is deliberately not set here: it is `code` on a workstation and a
-# terminal editor everywhere else. Every host.d layer must set it.
+# EDITOR is deliberately not set here either: it is `code` on a workstation and
+# a terminal editor everywhere else. Every host.d layer must set both.
 
 # Path additions. Listing a directory that does not exist is harmless.
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"

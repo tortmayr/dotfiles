@@ -81,7 +81,9 @@ directory:
   which supplies identity (name, email, signing key) and any local override.
 - `profile` — `.profile` ends with `. ~/.profile.local` when that file exists.
 
-`EDITOR` is intentionally **not** set here: every host layer must set it.
+`EDITOR` and `USER_GIT_DIR` are intentionally **not** set here: every host
+layer must set both. Defaulting them in the portable layer would run before
+`host.d` and leave an overlay's own `${VAR:-...}` unable to take effect.
 
 `install.sh` passes `--no-folding` to stow, so a private overlay package can
 populate the same directory as a public one.
