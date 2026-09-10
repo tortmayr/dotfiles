@@ -2,8 +2,10 @@
     "node_version": "24",
     "features": [
         "+playwright-cli",
+        "+shell-ext",
         "-devtools"
     ],
     "session_tint": "#2d2638",
-    "no_api_key": true
+    "no_api_key": true,
+    "skills_validation": "agent"
 }

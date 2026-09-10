@@ -12,6 +12,9 @@ set -euo pipefail
 #   -p, --profile NAME   profile from profiles/ (default: workstation)
 #   -t, --target DIR     install into DIR (default: $HOME)
 #   -m, --method MODE    stow (default) or copy, for hosts without GNU Stow
+#   -S, --stow           link the packages (default)
+#   -R, --restow         relink them, dropping links a rename left behind
+#   -D, --delete         remove the links again (stow method only)
 #   -n, --dry-run        report what would happen, change nothing
 #   -h, --help           this text
 #
@@ -24,6 +27,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="workstation"
 TARGET="$HOME"
 METHOD="stow"
+ACTION="stow"
 DRY_RUN=false
 PACKAGES=()
 
@@ -36,8 +40,11 @@ while [[ $# -gt 0 ]]; do
     -p|--profile) PROFILE="${2:?--profile needs a name}"; shift ;;
     -t|--target)  TARGET="${2:?--target needs a directory}"; shift ;;
     -m|--method)  METHOD="${2:?--method needs stow or copy}"; shift ;;
+    -S|--stow)    ACTION="stow" ;;
+    -R|--restow)  ACTION="restow" ;;
+    -D|--delete)  ACTION="delete" ;;
     -n|--dry-run) DRY_RUN=true ;;
-    -h|--help)    sed -n '5,21p' "$0"; exit 0 ;;
+    -h|--help)    sed -n '5,24p' "$0"; exit 0 ;;
     -*)           err "Unknown option: $1"; exit 1 ;;
     *)            PACKAGES+=("$1") ;;
   esac
@@ -80,14 +87,23 @@ fi
 mkdir -p "$TARGET"
 
 if [[ "$METHOD" == "stow" ]]; then
+  case "$ACTION" in
+    stow)   action_flag=-S ;;
+    restow) action_flag=-R ;;
+    delete) action_flag=-D ;;
+  esac
   # --no-folding keeps real directories and links individual files, so a
   # second package (a host-specific overlay) can populate the same directory.
-  args=(-d "$REPO_DIR" -t "$TARGET" --no-folding -S)
+  args=(-d "$REPO_DIR" -t "$TARGET" --no-folding "$action_flag")
   $DRY_RUN && args=(-n -v "${args[@]}")
   stow "${args[@]}" "${PACKAGES[@]}"
 else
   # Plain copy for images that have no stow: same result, no symlinks back
   # into a checkout that will not exist at runtime.
+  if [[ "$ACTION" == "delete" ]]; then
+    err "--delete needs the stow method: copied files are not tracked"
+    exit 1
+  fi
   for pkg in "${PACKAGES[@]}"; do
     if $DRY_RUN; then
       info "would copy $pkg/ -> $TARGET/"
@@ -98,4 +114,8 @@ else
 fi
 
 $DRY_RUN && { ok "Dry run complete"; exit 0; }
-ok "Installed ${#PACKAGES[@]} package(s) into $TARGET"
+case "$ACTION" in
+  stow)   ok "Installed ${#PACKAGES[@]} package(s) into $TARGET" ;;
+  restow) ok "Relinked ${#PACKAGES[@]} package(s) in $TARGET" ;;
+  delete) ok "Removed ${#PACKAGES[@]} package(s) from $TARGET" ;;
+esac
