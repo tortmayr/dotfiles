@@ -1,0 +1,3 @@
+# Nothing machine-local belongs in this repository.
+.zcompdump*
+.zcompcache/

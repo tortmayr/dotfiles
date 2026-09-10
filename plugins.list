@@ -1,0 +1,8 @@
+# Zsh plugins
+romkatv/powerlevel10k           v1.20.0
+zsh-users/zsh-completions       0.35.0
+zsh-users/zsh-syntax-highlighting 0.8.0
+zsh-users/zsh-autosuggestions   v0.7.1
+
+# Tmux plugins
+catppuccin/tmux                 v2.1.3
