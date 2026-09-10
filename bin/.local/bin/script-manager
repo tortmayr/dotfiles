@@ -1,0 +1,1375 @@
+#!/usr/bin/env bash
+
+
+# Script Manager - Project-specific shell script management tool
+# Usage: script-manager [-h] [-a] [-e] [-d] [-l] [--config] [script_name] [args...]
+
+# Show help function
+show_help() {
+  cat << EOF
+Script Manager - Project-specific shell script management tool
+
+USAGE:
+    sm [OPTIONS] [script_name] [script_arguments...]
+
+EXECUTION OPTIONS:
+    -h, --help          Show this help message
+    -l, --list          List available scripts (no fzf)
+
+EDITING OPTIONS:
+    -a, --add           Add new script to current directory
+    -e, --edit [name]   Edit existing script (interactive if no name)
+    -d, --delete [name] Delete script (interactive if no name)
+    --config            Open config.json in \$EDITOR
+
+ARGUMENTS:
+    script_name         Script to execute (interactive fzf selection if omitted)
+    script_arguments    Arguments to pass to the script
+
+DESCRIPTION:
+    Script Manager allows you to define and execute project-specific scripts
+    from a central JSON configuration file. Scripts are organized by directory
+    path and support four types of definitions:
+
+    1. Shell commands - Direct shell command execution
+    2. Script file references - Execute script files with optional embedded arguments
+    3. VS Code workspace references - Open workspaces with optional arguments
+    4. Script references - Run other named scripts in sequence (same instance)
+
+CONFIGURATION:
+    Config file:     \$SCRIPT_MANAGER_CONFIG_DIR/config.json
+                     (or \$XDG_CONFIG_HOME/script-manager/config.json)
+                     (or ~/.config/script-manager/config.json)
+    Script files:    \$SCRIPT_MANAGER_CONFIG_DIR/scripts/
+    Workspace files: \$SCRIPT_MANAGER_CONFIG_DIR/workspaces/
+
+ENVIRONMENT VARIABLES:
+    SCRIPT_MANAGER_CONFIG_DIR  Custom config directory (overrides XDG_CONFIG_HOME)
+    XDG_CONFIG_HOME            Standard config directory (fallback)
+    EDITOR                     Preferred editor for script files and config
+
+EXAMPLES:
+    sm                    # Interactive script selection with fzf
+    sm build              # Execute script named 'build' directly
+    sm deploy prod        # Execute 'deploy' script with 'prod' argument
+    sm -a                 # Add new script to current directory
+    sm -e build           # Edit the 'build' script
+    sm -d                 # Delete a script (interactive selection)
+    sm -l                 # List all available scripts
+    sm --config           # Open config.json in editor
+    sm -h                 # Show this help
+
+INTERACTIVE MODE:
+    When running without arguments, use fzf to select a script:
+    - Press Enter to execute the selected script
+    - Press Ctrl+E to edit the selected script
+    - Press Ctrl+C to cancel
+
+SCRIPT TYPES:
+    Shell command:    "echo 'hello world'"
+    File reference:   "file:deploy.sh --env=production"
+    VS Code workspace: "code:project.code-workspace --new-window"
+    Script reference: "run:build test deploy"
+
+    File and code references support embedded arguments that are combined
+    with any runtime arguments you provide.
+
+    Script references ("run:") take a space-separated list of other script
+    names defined in the same config hierarchy. They run in order and stop
+    on the first failure (like &&). Names only — no shell operators or args.
+
+SCRIPT ORDERING:
+    Scripts are listed with current directory scripts first, then inherited
+    scripts from parent directories. Child directory scripts override parent
+    scripts with the same name.
+
+EDITOR SUPPORT:
+    Editor priority: \$EDITOR → code → nano → vi
+EOF
+}
+
+# Parameter handling
+ADD_SCRIPT=false
+EDIT_SCRIPT=false
+DELETE_SCRIPT=false
+LIST_SCRIPTS=false
+OPEN_CONFIG=false
+
+while getopts "haedl-:" opt; do
+  case $opt in
+    h) show_help; exit 0 ;;
+    a) ADD_SCRIPT=true ;;
+    e) EDIT_SCRIPT=true ;;
+    d) DELETE_SCRIPT=true ;;
+    l) LIST_SCRIPTS=true ;;
+    -)
+      case "$OPTARG" in
+        help) show_help; exit 0 ;;
+        add) ADD_SCRIPT=true ;;
+        edit) EDIT_SCRIPT=true ;;
+        delete) DELETE_SCRIPT=true ;;
+        list) LIST_SCRIPTS=true ;;
+        config) OPEN_CONFIG=true ;;
+        *) echo "Unknown option --$OPTARG" >&2; exit 1 ;;
+      esac
+      ;;
+    *) echo "Usage: script-manager [-h] [-a] [-e] [-d] [-l] [--config] [script_name] [script_arguments...]" >&2; exit 1 ;;
+  esac
+done
+
+# Shift to get positional arguments after options
+shift $((OPTIND-1))
+
+# Get the script name argument if provided
+DIRECT_SCRIPT_NAME="$1"
+# Capture any additional arguments after the script name
+if [ -n "$DIRECT_SCRIPT_NAME" ]; then
+  shift  # Remove script name from arguments
+  SCRIPT_ARGS=("$@")  # Capture remaining arguments as script arguments
+else
+  SCRIPT_ARGS=()
+fi
+
+# Dependency checking
+command -v jq >/dev/null || { echo "Error: jq is not installed" >&2; exit 1; }
+
+# Only require fzf if using interactive mode
+if [ -z "$DIRECT_SCRIPT_NAME" ] && ! $ADD_SCRIPT && ! $LIST_SCRIPTS && ! $OPEN_CONFIG; then
+  command -v fzf >/dev/null || { echo "Error: fzf is not installed" >&2; exit 1; }
+fi
+
+# Get config directory with fallback logic
+get_config_dir() {
+  if [ -n "$SCRIPT_MANAGER_CONFIG_DIR" ]; then
+    echo "$SCRIPT_MANAGER_CONFIG_DIR"
+  elif [ -n "$XDG_CONFIG_HOME" ]; then
+    echo "$XDG_CONFIG_HOME/script-manager"
+  else
+    echo "$HOME/.config/script-manager"
+  fi
+}
+
+config_file="$(get_config_dir)/config.json"
+
+# Get scripts directory
+get_scripts_dir() {
+  echo "$(get_config_dir)/scripts"
+}
+
+# Get workspaces directory
+get_workspaces_dir() {
+  echo "$(get_config_dir)/workspaces"
+}
+
+# Get preferred editor with fallback chain
+get_editor() {
+  if [ -n "$EDITOR" ]; then
+    echo "$EDITOR"
+  elif command -v code >/dev/null 2>&1; then
+    echo "code"
+  elif command -v nano >/dev/null 2>&1; then
+    echo "nano"
+  elif command -v vi >/dev/null 2>&1; then
+    echo "vi"
+  else
+    echo ""
+  fi
+}
+
+# Parse file specification into file and arguments
+# Usage: parse_file_spec "file:script.sh -v --flag" script_file embedded_args
+parse_file_spec() {
+  local file_spec="$1"
+  local -n script_file_ref="$2"
+  local -n embedded_args_ref="$3"
+
+  if [[ "$file_spec" =~ [[:space:]] ]]; then
+    script_file_ref="${file_spec%% *}"  # Everything before first space
+    embedded_args_ref="${file_spec#* }"   # Everything after first space
+  else
+    script_file_ref="$file_spec"
+    embedded_args_ref=""
+  fi
+}
+
+# Get script type from command string
+get_script_type() {
+  local command="$1"
+  if [[ "$command" =~ ^file: ]]; then
+    echo "file"
+  elif [[ "$command" =~ ^code: ]]; then
+    echo "code"
+  elif [[ "$command" =~ ^run: ]]; then
+    echo "run"
+  else
+    echo "shell"
+  fi
+}
+
+# Get user input with optional prefill
+get_input() {
+  local prompt="$1"
+  local default="$2"
+  local result
+
+  if [ -n "$default" ]; then
+    read -e -p "$prompt [$default]: " -i "$default" result
+    echo "${result:-$default}"
+  else
+    read -p "$prompt: " result
+    echo "$result"
+  fi
+}
+
+# Validate script command is not empty
+validate_non_empty() {
+  local value="$1"
+  local type="$2"
+  if [ -z "$value" ]; then
+    echo "Error: $type cannot be empty" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Handle file script creation/editing
+handle_file_script() {
+  local current_file="$1"
+  local current_args="$2"
+  local is_edit="${3:-false}"
+
+  echo "" >&2
+  if [ -n "$SCRIPT_MANAGER_CONFIG_DIR" ]; then
+    echo "Script files are stored in: \$SCRIPT_MANAGER_CONFIG_DIR/scripts/" >&2
+  else
+    echo "Script files are stored in: \$XDG_CONFIG_HOME/script-manager/scripts/ (or ~/.config/script-manager/scripts/)" >&2
+  fi
+
+  local new_file
+  if $is_edit; then
+    new_file=$(get_input "Script file path" "$current_file")
+  else
+    new_file=$(get_input "Script file path (e.g., 'deploy.sh' or 'subdir/deploy.sh')")
+  fi
+
+  validate_non_empty "$new_file" "Script file path" || return 1
+
+  # Check if script file exists (only for new scripts, not edits)
+  if ! $is_edit; then
+    local scripts_dir=$(get_scripts_dir)
+    local full_script_path="$scripts_dir/$new_file"
+
+    if [ ! -f "$full_script_path" ]; then
+      echo "" >&2
+      read -p "Script file doesn't exist. Create it? (y/N): " create_file
+      if [[ "$create_file" =~ ^[Yy]$ ]]; then
+        mkdir -p "$(dirname "$full_script_path")"
+        cat > "$full_script_path" << 'EOF'
+#!/usr/bin/env bash
+
+
+# TODO: Add your script logic here
+echo "Script executed from: $(pwd)"
+
+EOF
+        chmod +x "$full_script_path"
+        echo "Created script file: $full_script_path" >&2
+      else
+        echo "Script addition cancelled - file does not exist and will not be created" >&2
+        return 1
+      fi
+    fi
+  fi
+
+  echo "" >&2
+  echo "Optional: Add embedded arguments to be passed to the script" >&2
+  echo "Example: -v --env=production --debug" >&2
+
+  local new_args
+  if $is_edit; then
+    new_args=$(get_input "Embedded arguments" "$current_args")
+  else
+    new_args=$(get_input "Embedded arguments (leave empty for none)")
+  fi
+
+  # Return the command (to stdout)
+  if [ -n "$new_args" ]; then
+    echo "file:$new_file $new_args"
+  else
+    echo "file:$new_file"
+  fi
+}
+
+# Handle code workspace creation/editing
+handle_code_script() {
+  local current_workspace="$1"
+  local current_args="$2"
+  local is_edit="${3:-false}"
+
+  echo "" >&2
+  if [ -n "$SCRIPT_MANAGER_CONFIG_DIR" ]; then
+    echo "Workspace files are stored in: \$SCRIPT_MANAGER_CONFIG_DIR/workspaces/" >&2
+  else
+    echo "Workspace files are stored in: \$XDG_CONFIG_HOME/script-manager/workspaces/ (or ~/.config/script-manager/workspaces/)" >&2
+  fi
+
+  local new_workspace
+  if $is_edit; then
+    new_workspace=$(get_input "Workspace file path" "$current_workspace")
+  else
+    new_workspace=$(get_input "Workspace file path (e.g., 'my-project.code-workspace')")
+  fi
+
+  validate_non_empty "$new_workspace" "Workspace file path" || return 1
+
+  # Check VS Code availability
+  if ! command -v code >/dev/null 2>&1; then
+    echo "Warning: VS Code (code command) not found. Workspace reference will not work without it." >&2
+  fi
+
+  # Check workspace file (only inform for new scripts)
+  if ! $is_edit; then
+    local workspaces_dir=$(get_workspaces_dir)
+    local full_workspace_path="$workspaces_dir/$new_workspace"
+    if [ ! -f "$full_workspace_path" ]; then
+      echo "" >&2
+      echo "Workspace file doesn't exist: $full_workspace_path" >&2
+      echo "Note: You can still create the workspace reference. The file can be created later." >&2
+    fi
+  fi
+
+  echo "" >&2
+  echo "Optional: Add embedded arguments to be passed to VS Code" >&2
+  echo "Example: --disable-extensions --new-window" >&2
+
+  local new_args
+  if $is_edit; then
+    new_args=$(get_input "Embedded arguments" "$current_args")
+  else
+    new_args=$(get_input "Embedded arguments (leave empty for none)")
+  fi
+
+  # Return the command (to stdout)
+  if [ -n "$new_args" ]; then
+    echo "code:$new_workspace $new_args"
+  else
+    echo "code:$new_workspace"
+  fi
+}
+
+# Handle shell command creation/editing
+handle_shell_script() {
+  local current_command="$1"
+  local is_edit="${2:-false}"
+
+  echo "" >&2
+  local new_command
+  if $is_edit; then
+    new_command=$(get_input "Shell command" "$current_command")
+  else
+    new_command=$(get_input "Enter shell command")
+  fi
+
+  validate_non_empty "$new_command" "Command" || return 1
+  echo "$new_command"
+}
+
+# Get type choices for edit menu
+get_type_choices() {
+  local current_type="$1"
+  case "$current_type" in
+    file)
+      echo "1) Keep as script file reference"
+      echo "2) Change to shell command"
+      echo "3) Change to VS Code workspace reference"
+      ;;
+    code)
+      echo "1) Keep as VS Code workspace reference"
+      echo "2) Change to shell command"
+      echo "3) Change to script file reference"
+      ;;
+    *)
+      echo "1) Keep as shell command"
+      echo "2) Change to script file reference"
+      echo "3) Change to VS Code workspace reference"
+      ;;
+  esac
+}
+
+# Handle script type editing based on choice
+handle_type_choice() {
+  local choice="$1"
+  local current_type="$2"
+  local old_script_command="$3"
+
+  case "$choice" in
+    1)
+      # Keep current type
+      case "$current_type" in
+        file)
+          local file_spec="${old_script_command#file:}"
+          local current_file current_args
+          parse_file_spec "$file_spec" current_file current_args
+          handle_file_script "$current_file" "$current_args" true
+          ;;
+        code)
+          local workspace_spec="${old_script_command#code:}"
+          local current_workspace current_args
+          parse_file_spec "$workspace_spec" current_workspace current_args
+          handle_code_script "$current_workspace" "$current_args" true
+          ;;
+        *)
+          handle_shell_script "$old_script_command" true
+          ;;
+      esac
+      ;;
+    2)
+      # Change type (different for each current type)
+      case "$current_type" in
+        file|code) handle_shell_script "" false ;;
+        *) handle_file_script "" "" false ;;
+      esac
+      ;;
+    3)
+      # Third option (different for each current type)
+      case "$current_type" in
+        file) handle_code_script "" "" false ;;
+        code) handle_file_script "" "" false ;;
+        *) handle_code_script "" "" false ;;
+      esac
+      ;;
+    *)
+      echo "Invalid choice"
+      return 1
+      ;;
+  esac
+}
+
+# Detect git worktree and compute path mappings
+# Sets lookup_dir (for config key matching) and execution_dir (for running scripts)
+resolve_worktree_paths() {
+  local current_dir="$1"
+  local -n _lookup_dir="$2"
+  local -n _execution_dir="$3"
+  local -n _main_repo_root="$4"
+  local -n _worktree_root="$5"
+
+  # Defaults: no remapping
+  _lookup_dir="$current_dir"
+  _execution_dir="$current_dir"
+  _main_repo_root=""
+  _worktree_root=""
+
+  # Check if we're in a git repo at all
+  local wt_root main_root
+  wt_root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+
+  # Get the main repo root via git-common-dir (shared across all worktrees)
+  local git_common_dir
+  git_common_dir=$(git rev-parse --git-common-dir 2>/dev/null) || return 0
+  main_root=$(cd "$git_common_dir" 2>/dev/null && pwd) || return 0
+  main_root=$(dirname "$main_root")  # Strip /.git
+
+  # If roots match, we're in the main worktree — no remapping needed
+  [ "$wt_root" = "$main_root" ] && return 0
+
+  _main_repo_root="$main_root"
+  _worktree_root="$wt_root"
+
+  # Remap current_dir by substituting the worktree prefix with the main-repo prefix
+  _lookup_dir="${current_dir/#$wt_root/$main_root}"
+  _execution_dir="$current_dir"
+}
+
+# Directory hierarchy traversal helper
+get_directory_hierarchy() {
+  local current_dir="$1"
+  local directories=()
+
+  # Directory traversal like git operations
+  while [ "$current_dir" != "/" ]; do
+    directories+=("$current_dir")
+    current_dir=$(dirname "$current_dir")
+  done
+
+  # Return in order: current -> parent -> grandparent
+  printf '%s\n' "${directories[@]}"
+}
+
+# Get available scripts from config with parent directory lookup
+get_available_scripts() {
+  local target_dir="$1"
+  local config_file="$2"
+
+  # Check config file exists
+  if [ ! -f "$config_file" ]; then
+    return 1
+  fi
+
+  # Validate JSON
+  if ! jq . "$config_file" >/dev/null 2>&1; then
+    echo "Error: Invalid JSON in config file: $config_file" >&2
+    return 1
+  fi
+
+  # Get directory hierarchy
+  local hierarchy=$(get_directory_hierarchy "$target_dir")
+  local current_dir_scripts=""
+  local parent_dir_scripts=""
+  declare -A seen_scripts
+  local is_first_dir=true
+
+  # Process directories from current to root for child precedence
+  while IFS= read -r dir; do
+    local dir_scripts=$(jq -r --arg dir "$dir" '
+      if has($dir) then
+        .[$dir] | to_entries[] | "\(.key)|\(.value)|\($dir)"
+      else
+        empty
+      end
+    ' "$config_file" 2>/dev/null)
+
+    # Add scripts if not already seen (child precedence)
+    if [ -n "$dir_scripts" ]; then
+      while IFS= read -r script_line; do
+        if [ -n "$script_line" ]; then
+          local script_name="${script_line%%|*}"
+          # Check if script name already seen (child precedence)
+          if [ -z "${seen_scripts[$script_name]+x}" ]; then
+            seen_scripts[$script_name]=1
+            # Separate current directory scripts from parent directory scripts
+            if $is_first_dir; then
+              current_dir_scripts="${current_dir_scripts:+$current_dir_scripts$'\n'}$script_line"
+            else
+              parent_dir_scripts="${parent_dir_scripts:+$parent_dir_scripts$'\n'}$script_line"
+            fi
+          fi
+        fi
+      done <<< "$dir_scripts"
+    fi
+    is_first_dir=false
+  done <<< "$hierarchy"
+
+  # Combine with current directory scripts first, then parent directory scripts
+  local all_scripts="$current_dir_scripts"
+  all_scripts="${all_scripts:+$all_scripts$'\n'}$parent_dir_scripts"
+
+  echo "$all_scripts"
+}
+
+# Find script by name from available scripts
+find_script_by_name() {
+  local script_name="$1"
+  local available_scripts="$2"
+
+  # Look for exact match using string comparison (avoids regex injection)
+  while IFS= read -r line; do
+    if [ "${line%%|*}" = "$script_name" ]; then
+      echo "$line"
+      return 0
+    fi
+  done <<< "$available_scripts"
+
+  return 1
+}
+
+# Interactive fzf selection from available scripts
+fzf_select_script() {
+  local prompt_label="$1"
+  local available_scripts="$2"
+
+  local script_names=$(echo "$available_scripts" | cut -d'|' -f1)
+  echo "$script_names" | fzf \
+    --prompt="$prompt_label" \
+    --height=40% \
+    --border \
+    --preview="
+      script_name='{}'
+      script_line=\$(echo '$available_scripts' | grep \"^\$script_name|\")
+      script_command=\$(echo \"\$script_line\" | cut -d'|' -f2)
+      provider_dir=\$(echo \"\$script_line\" | cut -d'|' -f3)
+
+      echo \"Provider directory: \$provider_dir\"
+      echo \"---\"
+
+      if [[ \"\$script_command\" =~ ^file: ]]; then
+        echo \"Script file: \${script_command#file:}\"
+      elif [[ \"\$script_command\" =~ ^code: ]]; then
+        echo \"Workspace file: \${script_command#code:}\"
+      else
+        echo \"Command: \$script_command\"
+      fi
+    " \
+    --preview-window='right:60%'
+}
+
+# Execute script command or file reference
+execute_script() {
+  local script_def="$1"
+  local main_repo_root="$2"
+  local worktree_root="$3"
+  shift 3  # Remove script_def and root args
+  # Remaining "$@" are runtime arguments with boundaries preserved
+
+  # Parse script definition (now includes provider directory)
+  local script_name="${script_def%%|*}"
+  local remaining="${script_def#*|}"
+  local script_command="${remaining%|*}"
+  local provider_dir="${script_def##*|}"
+
+  # Remap provider_dir from main repo to worktree when applicable
+  if [ -n "$main_repo_root" ] && [ -n "$worktree_root" ]; then
+    provider_dir="${provider_dir/#$main_repo_root/$worktree_root}"
+  fi
+
+  local script_type=$(get_script_type "$script_command")
+
+  case "$script_type" in
+    file)
+      local file_spec="${script_command#file:}"
+      local script_file embedded_args
+      parse_file_spec "$file_spec" script_file embedded_args
+
+      local scripts_dir=$(get_scripts_dir)
+      local full_path="$scripts_dir/$script_file"
+
+      # Ensure parent directories exist for the script file
+      local script_dir=$(dirname "$full_path")
+      if [ ! -d "$script_dir" ]; then
+        echo "Error: Script directory not found: $script_dir" >&2
+        return 1
+      fi
+
+      if [ -x "$full_path" ]; then
+        # Build argument array: embedded args (split) + runtime args (preserved)
+        local -a all_args=()
+        if [ -n "$embedded_args" ]; then
+          read -ra all_args <<< "$embedded_args"
+        fi
+        all_args+=("$@")
+
+        (cd "$provider_dir" && "$full_path" "${all_args[@]}")
+      elif [ -f "$full_path" ]; then
+        echo "Error: Script file not executable: $full_path" >&2
+        echo "Run: chmod +x '$full_path'" >&2
+        return 1
+      else
+        echo "Error: Script file not found: $full_path" >&2
+        echo "Expected location: $full_path" >&2
+        return 1
+      fi
+      ;;
+    code)
+      local workspace_spec="${script_command#code:}"
+      local workspace_file embedded_args
+      parse_file_spec "$workspace_spec" workspace_file embedded_args
+
+      local workspaces_dir=$(get_workspaces_dir)
+      local full_path="$workspaces_dir/$workspace_file"
+
+      # Check if VS Code is available
+      if ! command -v code >/dev/null 2>&1; then
+        echo "Error: VS Code (code command) not found" >&2
+        return 1
+      fi
+
+      # Check if workspace file exists
+      if [ -f "$full_path" ]; then
+        # Build argument array: embedded args (split) + runtime args (preserved)
+        local -a all_args=()
+        if [ -n "$embedded_args" ]; then
+          read -ra all_args <<< "$embedded_args"
+        fi
+        all_args+=("$@")
+
+        (cd "$provider_dir" && code "$full_path" "${all_args[@]}")
+      else
+        echo "Error: Workspace file not found: $full_path" >&2
+        echo "Expected location: $full_path" >&2
+        return 1
+      fi
+      ;;
+    run)
+      # Run a sequence of other scripts (by name) in the same instance.
+      # Each name is resolved against the available scripts and executed in
+      # order; the chain stops on the first non-zero exit (like &&).
+      local names_spec="${script_command#run:}"
+      local -a ref_names=()
+      read -ra ref_names <<< "$names_spec"
+
+      if [ ${#ref_names[@]} -eq 0 ]; then
+        echo "Error: 'run:' requires at least one script name" >&2
+        return 1
+      fi
+
+      local ref_name ref_def saved_stack rc
+      for ref_name in "${ref_names[@]}"; do
+        # Cycle detection across the active run chain
+        if [[ " $__SM_RUN_STACK " == *" $ref_name "* ]]; then
+          echo "Error: cyclic script reference: ${__SM_RUN_STACK# } -> $ref_name" >&2
+          return 1
+        fi
+
+        ref_def=$(find_script_by_name "$ref_name" "$__SM_AVAILABLE_SCRIPTS")
+        if [ -z "$ref_def" ]; then
+          echo "Error: referenced script '$ref_name' not found" >&2
+          return 1
+        fi
+
+        saved_stack="$__SM_RUN_STACK"
+        __SM_RUN_STACK="$__SM_RUN_STACK $ref_name"
+        execute_script "$ref_def" "$main_repo_root" "$worktree_root"
+        rc=$?
+        __SM_RUN_STACK="$saved_stack"
+
+        if [ "$rc" -ne 0 ]; then
+          echo "Error: script '$ref_name' failed (exit $rc); stopping chain" >&2
+          return "$rc"
+        fi
+      done
+      ;;
+    *)
+      # Execute shell command in provider directory
+      if [ $# -gt 0 ]; then
+        (cd "$provider_dir" && eval "$script_command $*")
+      else
+        (cd "$provider_dir" && eval "$script_command")
+      fi
+      ;;
+  esac
+}
+
+# Check if script name already exists in directory
+check_script_conflict() {
+  local config_file="$1"
+  local directory="$2"
+  local script_name="$3"
+
+  # Check if the directory exists in config and has the script name
+  local existing_script=$(jq -r --arg dir "$directory" --arg name "$script_name" '
+    if has($dir) and .[$dir] | has($name) then
+      .[$dir][$name]
+    else
+      empty
+    end
+  ' "$config_file" 2>/dev/null)
+
+  if [ -n "$existing_script" ]; then
+    return 0  # Conflict exists
+  else
+    return 1  # No conflict
+  fi
+}
+
+# Add new script to configuration
+add_script() {
+  local config_file="$1"
+  local current_dir="$2"
+
+  echo "Adding new script for directory: $current_dir"
+
+  # Show existing scripts in this directory
+  local existing_scripts=$(jq -r --arg dir "$current_dir" '
+    if has($dir) then
+      .[$dir] | keys[]
+    else
+      empty
+    end
+  ' "$config_file" 2>/dev/null)
+
+  if [ -n "$existing_scripts" ]; then
+    echo ""
+    echo "Existing scripts in this directory:"
+    echo "$existing_scripts" | sed 's/^/  - /'
+  fi
+  echo ""
+
+  # Get script name with conflict checking
+  local script_name
+  while true; do
+    script_name=$(get_input "Script name")
+    validate_non_empty "$script_name" "Script name" || continue
+
+    # Check for conflicts in the same directory
+    if check_script_conflict "$config_file" "$current_dir" "$script_name"; then
+      local existing_command=$(jq -r --arg dir "$current_dir" --arg name "$script_name" '
+        .[$dir][$name]
+      ' "$config_file" 2>/dev/null)
+
+      echo ""
+      echo "⚠️  Conflict: Script '$script_name' already exists in this directory"
+      echo "   Current definition: $existing_command"
+      echo ""
+      echo "Options:"
+      echo "1) Choose a different name"
+      echo "2) Overwrite existing script"
+      echo "3) Cancel"
+      read -p "Choice (1/2/3): " conflict_choice
+
+      case $conflict_choice in
+        1) echo ""; continue ;;
+        2) echo ""; echo "Will overwrite existing script '$script_name'"; break ;;
+        3) echo "Cancelled"; return 1 ;;
+        *) echo "Invalid choice, please try again"; echo ""; continue ;;
+      esac
+    else
+      break  # No conflict, proceed
+    fi
+  done
+
+  echo ""
+  echo "Choose script type:"
+  echo "1) Shell command"
+  echo "2) Script file reference (supports embedded arguments)"
+  echo "3) VS Code workspace reference (supports embedded arguments)"
+  read -p "Choice (1/2/3): " script_type
+
+  local script_command
+  case $script_type in
+    1) script_command=$(handle_shell_script) || return 1 ;;
+    2)
+      script_command=$(handle_file_script "" "" false) || return 1
+      # Ask if user wants to edit the created script file
+      if [[ "$script_command" =~ ^file: ]]; then
+        local file_spec="${script_command#file:}"
+        local script_file="${file_spec%% *}"
+        local scripts_dir=$(get_scripts_dir)
+        local full_script_path="$scripts_dir/$script_file"
+
+        echo ""
+        read -p "Open script file in editor? (y/N): " open_editor
+        if [[ "$open_editor" =~ ^[Yy]$ ]]; then
+          local editor_cmd=$(get_editor)
+          if [ -z "$editor_cmd" ]; then
+            echo "No suitable editor found. Set \$EDITOR environment variable or install code/nano/vi"
+            return 1
+          fi
+
+          echo "Opening $full_script_path in $editor_cmd..."
+          if [ -f "$full_script_path" ]; then
+            "$editor_cmd" "$full_script_path"
+          else
+            echo "Script file not found: $full_script_path"
+          fi
+        fi
+      fi
+      ;;
+    3) script_command=$(handle_code_script "" "" false) || return 1 ;;
+    *) echo "Invalid choice"; return 1 ;;
+  esac
+
+  # Add to configuration using jq
+  local temp_config=$(mktemp)
+  local was_overwrite=false
+
+  # Check if this was an overwrite
+  if check_script_conflict "$config_file" "$current_dir" "$script_name"; then
+    was_overwrite=true
+  fi
+
+  if jq --arg dir "$current_dir" --arg name "$script_name" --arg cmd "$script_command" \
+     'if has($dir) then .[$dir][$name] = $cmd else .[$dir] = {($name): $cmd} end' \
+     "$config_file" > "$temp_config"; then
+    mv "$temp_config" "$config_file"
+    echo ""
+    if $was_overwrite; then
+      echo "✅ Overwritten script '$script_name' in configuration"
+    else
+      echo "✅ Added script '$script_name' to configuration"
+    fi
+    echo "Directory: $current_dir"
+    echo "Command/File: $script_command"
+    echo ""
+    echo "You can now run: sm $script_name"
+  else
+    rm -f "$temp_config"
+    echo "❌ Failed to update configuration"
+    return 1
+  fi
+}
+
+# Edit existing script
+edit_script() {
+  local config_file="$1"
+  local current_dir="$2"
+  local script_name="$3"
+
+  # Find the script in the directory hierarchy
+  local available_scripts=$(get_available_scripts "$current_dir" "$config_file")
+
+  if [ -z "$available_scripts" ]; then
+    echo "No scripts found for directory: $current_dir"
+    return 1
+  fi
+
+  local script_to_edit=""
+
+  # If script name provided, find it directly
+  if [ -n "$script_name" ]; then
+    script_to_edit=$(find_script_by_name "$script_name" "$available_scripts")
+    if [ -z "$script_to_edit" ]; then
+      echo "Error: Script '$script_name' not found"
+      echo ""
+      echo "Available scripts:"
+      echo "$available_scripts" | cut -d'|' -f1 | sed 's/^/  - /'
+      return 1
+    fi
+  else
+    # Interactive selection
+    local selected_name=$(fzf_select_script "Select script to edit: " "$available_scripts")
+
+    if [ -z "$selected_name" ]; then
+      echo "No script selected"
+      return 1
+    fi
+
+    script_to_edit=$(find_script_by_name "$selected_name" "$available_scripts")
+  fi
+
+  # Parse the script information
+  local old_script_name="${script_to_edit%%|*}"
+  local remaining="${script_to_edit#*|}"
+  local old_script_command="${remaining%|*}"
+  local provider_dir="${script_to_edit##*|}"
+
+  echo "Editing script: $old_script_name"
+  echo "Provider directory: $provider_dir"
+  echo "Current definition: $old_script_command"
+  echo ""
+
+  # Only allow editing scripts from the current directory (not inherited ones)
+  if [ "$provider_dir" != "$current_dir" ]; then
+    echo "⚠️  This script is inherited from parent directory: $provider_dir"
+    echo "You can only edit scripts defined in the current directory: $current_dir"
+    echo ""
+    echo "Options:"
+    echo "1) Create a new script in current directory (will override inherited one)"
+    echo "2) Cancel"
+    read -p "Choice (1/2): " inherit_choice
+
+    case $inherit_choice in
+      1)
+        echo ""
+        echo "Creating new script '$old_script_name' in current directory"
+        echo "This will override the inherited script from $provider_dir"
+        ;;
+      2)
+        echo "Cancelled"
+        return 1
+        ;;
+      *)
+        echo "Invalid choice"
+        return 1
+        ;;
+    esac
+  fi
+
+  # Edit script name
+  echo "Script name:"
+  local new_script_name=$(get_input "New name" "$old_script_name")
+
+  # Check for conflicts if name changed
+  if [ "$new_script_name" != "$old_script_name" ]; then
+    if check_script_conflict "$config_file" "$current_dir" "$new_script_name"; then
+      local existing_command=$(jq -r --arg dir "$current_dir" --arg name "$new_script_name" '
+        .[$dir][$name]
+      ' "$config_file" 2>/dev/null)
+
+      echo ""
+      echo "⚠️  Conflict: Script '$new_script_name' already exists in this directory"
+      echo "   Current definition: $existing_command"
+      echo ""
+      read -p "Overwrite existing script? (y/N): " overwrite_choice
+      if [[ ! "$overwrite_choice" =~ ^[Yy]$ ]]; then
+        echo "Edit cancelled"
+        return 1
+      fi
+    fi
+  fi
+
+  # Edit script command/file
+  echo ""
+  echo "Current command/file: $old_script_command"
+
+  local current_type=$(get_script_type "$old_script_command")
+  echo ""
+  get_type_choices "$current_type"
+  read -p "Choice (1/2/3): " type_choice
+
+  local new_script_command
+  new_script_command=$(handle_type_choice "$type_choice" "$current_type" "$old_script_command") || return 1
+
+  # Update the configuration
+  local temp_config=$(mktemp)
+
+  # Remove old script if name changed
+  if [ "$new_script_name" != "$old_script_name" ] && [ "$provider_dir" == "$current_dir" ]; then
+    jq --arg dir "$current_dir" --arg old_name "$old_script_name" \
+       'del(.[$dir][$old_name])' \
+       "$config_file" > "$temp_config"
+    mv "$temp_config" "$config_file"
+  fi
+
+  # Add/update new script
+  if jq --arg dir "$current_dir" --arg name "$new_script_name" --arg cmd "$new_script_command" \
+     'if has($dir) then .[$dir][$name] = $cmd else .[$dir] = {($name): $cmd} end' \
+     "$config_file" > "$temp_config"; then
+    mv "$temp_config" "$config_file"
+    echo ""
+    echo "✅ Updated script configuration"
+    echo "Name: $old_script_name → $new_script_name"
+    echo "Command/File: $old_script_command → $new_script_command"
+    echo "Directory: $current_dir"
+    echo ""
+    echo "You can now run: sm $new_script_name"
+  else
+    rm -f "$temp_config"
+    echo "❌ Failed to update configuration"
+    return 1
+  fi
+}
+
+# Delete existing script
+delete_script() {
+  local config_file="$1"
+  local current_dir="$2"
+  local script_name="$3"
+
+  # Get available scripts
+  local available_scripts=$(get_available_scripts "$current_dir" "$config_file")
+
+  if [ -z "$available_scripts" ]; then
+    echo "No scripts found for directory: $current_dir"
+    return 1
+  fi
+
+  local script_to_delete=""
+
+  # If script name provided, find it directly
+  if [ -n "$script_name" ]; then
+    script_to_delete=$(find_script_by_name "$script_name" "$available_scripts")
+    if [ -z "$script_to_delete" ]; then
+      echo "Error: Script '$script_name' not found"
+      echo ""
+      echo "Available scripts:"
+      echo "$available_scripts" | cut -d'|' -f1 | sed 's/^/  - /'
+      return 1
+    fi
+  else
+    # Interactive selection
+    local selected_name=$(fzf_select_script "Select script to delete: " "$available_scripts")
+
+    if [ -z "$selected_name" ]; then
+      echo "No script selected"
+      return 1
+    fi
+
+    script_to_delete=$(find_script_by_name "$selected_name" "$available_scripts")
+  fi
+
+  # Parse the script information
+  local delete_script_name="${script_to_delete%%|*}"
+  local remaining="${script_to_delete#*|}"
+  local delete_script_command="${remaining%|*}"
+  local provider_dir="${script_to_delete##*|}"
+
+  # Only allow deleting scripts from the current directory
+  if [ "$provider_dir" != "$current_dir" ]; then
+    echo "Error: Script '$delete_script_name' is inherited from parent directory: $provider_dir"
+    echo "You can only delete scripts defined in the current directory: $current_dir"
+    return 1
+  fi
+
+  # Show script details and confirm deletion
+  echo "Script to delete:"
+  echo "  Name: $delete_script_name"
+  echo "  Command: $delete_script_command"
+  echo "  Directory: $provider_dir"
+  echo ""
+  read -p "Are you sure you want to delete this script? (y/N): " confirm
+
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo "Cancelled"
+    return 1
+  fi
+
+  # Delete from config
+  local temp_config=$(mktemp)
+  if jq --arg dir "$current_dir" --arg name "$delete_script_name" \
+     'del(.[$dir][$name]) | if .[$dir] == {} then del(.[$dir]) else . end' \
+     "$config_file" > "$temp_config"; then
+    mv "$temp_config" "$config_file"
+    echo ""
+    echo "✅ Deleted script '$delete_script_name'"
+  else
+    rm -f "$temp_config"
+    echo "❌ Failed to delete script"
+    return 1
+  fi
+}
+
+# List available scripts
+list_scripts() {
+  local config_file="$1"
+  local current_dir="$2"
+  local worktree_root="${3:-}"
+
+  local available_scripts=$(get_available_scripts "$current_dir" "$config_file")
+
+  if [ -z "$available_scripts" ]; then
+    echo "No scripts found for directory: $current_dir"
+    echo "Use 'sm -a' to add scripts"
+    return 0
+  fi
+
+  if [ -n "$worktree_root" ]; then
+    echo "Scripts for: $worktree_root (worktree of $current_dir)"
+  else
+    echo "Scripts for: $current_dir"
+  fi
+  echo ""
+
+  local current_section_printed=false
+  local parent_section_printed=false
+
+  while IFS='|' read -r name command provider; do
+    if [ "$provider" = "$current_dir" ]; then
+      if ! $current_section_printed; then
+        echo "Current directory:"
+        current_section_printed=true
+      fi
+      printf "  %-20s %s\n" "$name" "$command"
+    else
+      if ! $parent_section_printed; then
+        [ $current_section_printed = true ] && echo ""
+        echo "Inherited from parent directories:"
+        parent_section_printed=true
+      fi
+      printf "  %-20s %s (from %s)\n" "$name" "$command" "$provider"
+    fi
+  done <<< "$available_scripts"
+}
+
+# Open config file in editor
+open_config() {
+  local config_file="$1"
+
+  if [ ! -f "$config_file" ]; then
+    echo "Config file not found: $config_file"
+    echo "Run 'sm -a' to create a configuration"
+    return 1
+  fi
+
+  local editor_cmd=$(get_editor)
+  if [ -z "$editor_cmd" ]; then
+    echo "No suitable editor found. Set \$EDITOR environment variable or install code/nano/vi"
+    return 1
+  fi
+
+  echo "Opening $config_file in $editor_cmd..."
+  "$editor_cmd" "$config_file"
+}
+
+# Create default configuration file
+create_default_config() {
+  local config_file="$1"
+  local current_dir="${2:-$(pwd)}"
+
+  # Ensure directory exists
+  local config_dir=$(dirname "$config_file")
+  mkdir -p "$config_dir"
+  cat > "$config_file" << EOF
+{
+    "$current_dir": {
+        "example": "echo 'Example script for current directory'"
+    }
+}
+EOF
+
+  if [ -f "$config_file" ]; then
+    echo "Created default configuration: $config_file"
+    echo "Edit the file to add your project-specific scripts."
+  fi
+}
+
+# Main execution
+main() {
+  local current_dir=$(pwd)
+
+  # Resolve worktree paths for config key matching vs execution
+  local lookup_dir execution_dir main_repo_root worktree_root
+  resolve_worktree_paths "$current_dir" lookup_dir execution_dir main_repo_root worktree_root
+
+  # Handle config open mode (doesn't require config to exist)
+  if $OPEN_CONFIG; then
+    if [ ! -f "$config_file" ]; then
+      create_default_config "$config_file" "$lookup_dir"
+    fi
+    open_config "$config_file"
+    exit $?
+  fi
+
+  # Create default config if missing
+  if [ ! -f "$config_file" ]; then
+    create_default_config "$config_file" "$lookup_dir"
+    if [ ! -f "$config_file" ]; then
+      echo "Error: Could not create configuration file" >&2
+      exit 1
+    fi
+  fi
+
+  # Handle add script mode
+  if $ADD_SCRIPT; then
+    add_script "$config_file" "$lookup_dir"
+    exit $?
+  fi
+
+  # Handle list scripts mode
+  if $LIST_SCRIPTS; then
+    list_scripts "$config_file" "$lookup_dir" "$worktree_root"
+    exit $?
+  fi
+
+  # Handle edit script mode
+  if $EDIT_SCRIPT; then
+    edit_script "$config_file" "$lookup_dir" "$DIRECT_SCRIPT_NAME"
+    exit $?
+  fi
+
+  # Handle delete script mode
+  if $DELETE_SCRIPT; then
+    delete_script "$config_file" "$lookup_dir" "$DIRECT_SCRIPT_NAME"
+    exit $?
+  fi
+
+  local available_scripts=$(get_available_scripts "$lookup_dir" "$config_file")
+
+  if [ -z "$available_scripts" ]; then
+    echo "No scripts found for directory: $lookup_dir" >&2
+    echo "Add scripts with 'sm -a' or edit config with 'sm --config'" >&2
+    exit 1
+  fi
+
+  # Expose the resolved script set so 'run:' references resolve in-process
+  __SM_AVAILABLE_SCRIPTS="$available_scripts"
+
+  # Handle direct script execution by name
+  if [ -n "$DIRECT_SCRIPT_NAME" ]; then
+    local direct_script=$(find_script_by_name "$DIRECT_SCRIPT_NAME" "$available_scripts")
+    if [ -n "$direct_script" ]; then
+      execute_script "$direct_script" "$main_repo_root" "$worktree_root" "${SCRIPT_ARGS[@]}"
+      exit $?
+    else
+      echo "Error: Script '$DIRECT_SCRIPT_NAME' not found" >&2
+      echo "" >&2
+      echo "Available scripts:" >&2
+      echo "$available_scripts" | cut -d'|' -f1 | sed 's/^/  - /' >&2
+      exit 1
+    fi
+  fi
+
+  # fzf integration with enhanced preview
+  local scripts_dir=$(get_scripts_dir)
+  local workspaces_dir=$(get_workspaces_dir)
+
+  # Create a temporary file with the full script data for the preview to access
+  local temp_scripts=$(mktemp)
+  trap 'rm -f "$temp_scripts"' EXIT
+  echo "$available_scripts" > "$temp_scripts"
+
+  # Extract just the script names for clean fzf display
+  local script_names=$(echo "$available_scripts" | cut -d'|' -f1)
+
+
+  local fzf_result=$(echo "$script_names" | fzf \
+    --prompt="Select script: " \
+    --header="Enter: Execute | Ctrl+E: Edit | Ctrl+C: Cancel" \
+    --bind="ctrl-e:accept" \
+    --expect="ctrl-e" \
+    --height=40% \
+    --border \
+    --preview="
+      script_name='{}'
+      scripts_dir=\"$scripts_dir\"
+      temp_file=\"$temp_scripts\"
+
+      # Look up the command for this script name in the temp file
+      script_line=\$(grep \"^\$script_name|\" \"\$temp_file\")
+      script_command=\$(echo \"\$script_line\" | cut -d'|' -f2)
+      provider_dir=\$(echo \"\$script_line\" | cut -d'|' -f3)
+
+      echo \"Provider directory: \$provider_dir\"
+      echo \"---\"
+
+      if [[ \"\$script_command\" =~ ^file: ]]; then
+        file_spec=\"\${script_command#file:}\"
+        script_file=\"\${file_spec%% *}\"
+        script_path=\"\$scripts_dir/\$script_file\"
+        echo \"Script file: \$script_file\"
+        [[ \"\$file_spec\" =~ [[:space:]] ]] && echo \"Arguments: \${file_spec#* }\"
+        if [ -f \"\$script_path\" ]; then
+          echo \"Location: \$script_path\"
+          echo \"---\"
+          if command -v bat >/dev/null 2>&1; then
+            bat --style=plain --color=always \"\$script_path\"
+          else
+            cat \"\$script_path\"
+          fi
+        else
+          echo \"---\"
+          echo \"File not found: \$script_path\"
+        fi
+      elif [[ \"\$script_command\" =~ ^code: ]]; then
+        workspace_spec=\"\${script_command#code:}\"
+        workspace_file=\"\${workspace_spec%% *}\"
+        workspaces_dir=\"$workspaces_dir\"
+        workspace_path=\"\$workspaces_dir/\$workspace_file\"
+        echo \"Workspace file: \$workspace_file\"
+        [[ \"\$workspace_spec\" =~ [[:space:]] ]] && echo \"Arguments: \${workspace_spec#* }\"
+        if [ -f \"\$workspace_path\" ]; then
+          echo \"Location: \$workspace_path\"
+          echo \"---\"
+          if command -v bat >/dev/null 2>&1; then
+            bat --style=plain --color=always \"\$workspace_path\"
+          else
+            cat \"\$workspace_path\"
+          fi
+        else
+          echo \"---\"
+          echo \"Workspace file not found: \$workspace_path\"
+        fi
+      else
+        echo \"Command: \$script_command\"
+        echo \"---\"
+        if command -v bat >/dev/null 2>&1; then
+          echo \"\$script_command\" | bat --style=plain --color=always -l bash
+        else
+          echo \"\$script_command\"
+        fi
+      fi
+    " \
+    --preview-window='right:60%')
+
+  # Parse fzf result (with --expect, first line is the key pressed, second is selection)
+  local key_pressed=$(echo "$fzf_result" | head -n1)
+  local selected_name=$(echo "$fzf_result" | tail -n1)
+
+  # Clean up temp file
+  rm -f "$temp_scripts"
+
+  # Handle the result based on key pressed
+  if [ -n "$selected_name" ]; then
+    if [ "$key_pressed" = "ctrl-e" ]; then
+      # Edit mode
+      edit_script "$config_file" "$lookup_dir" "$selected_name"
+      exit $?
+    else
+      # Execute the selected script directly
+      local script_def=$(find_script_by_name "$selected_name" "$available_scripts")
+      execute_script "$script_def" "$main_repo_root" "$worktree_root" "${SCRIPT_ARGS[@]}"
+      exit $?
+    fi
+  fi
+}
+
+main "$@"

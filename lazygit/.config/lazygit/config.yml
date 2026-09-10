@@ -1,0 +1,35 @@
+gui:
+  theme:
+    activeBorderColor:
+      - "#539bf5"
+      - bold
+    inactiveBorderColor:
+      - "#444c56"
+    searchingActiveBorderColor:
+      - "#c69026"
+      - bold
+    optionsTextColor:
+      - "#539bf5"
+    selectedLineBgColor:
+      - "#2d333b"
+    inactiveViewSelectedLineBgColor:
+      - "#22272e"
+    cherryPickedCommitFgColor:
+      - "#986ee2"
+    cherryPickedCommitBgColor:
+      - "#2d333b"
+    markedBaseCommitFgColor:
+      - "#c69026"
+    markedBaseCommitBgColor:
+      - "#2d333b"
+    unstagedChangesColor:
+      - "#e5534b"
+    defaultFgColor:
+      - "#adbac7"
+  authorColors:
+    "*": "#768390"
+git:
+  pagers:
+    - pager: delta --dark --paging=never --line-numbers --syntax-theme=GitHub-Dark-Dimmed
+    - pager: delta --dark --paging=never  --syntax-theme="GitHub-Dark-Dimmed"
+    - pager: delta --dark --paging=never --line-numbers --side-by-side --syntax-theme="GitHub-Dark-Dimmed"

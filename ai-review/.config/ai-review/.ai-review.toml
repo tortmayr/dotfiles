@@ -1,0 +1,14 @@
+[user]
+# Review tool: 'yoloarena' (default) or 'claude'.
+# tool = "yoloarena"
+
+# Enable UI testing (default: true).
+# ui_testing = true
+
+# Create review worktrees under here, grouped per project as
+# <worktree_root>/<project>/review-<target>. Supports ~ and $VARS.
+worktree_root = "~/Git/worktrees"
+
+# Inside herdr, open the review as a worktree child of the repo (shown grouped
+# under it in the sidebar) instead of a new tab. (default false)
+herdr_worktree = true

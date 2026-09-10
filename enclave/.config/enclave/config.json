@@ -1,0 +1,9 @@
+{
+    "node_version": "24",
+    "features": [
+        "+playwright-cli",
+        "-devtools"
+    ],
+    "session_tint": "#2d2638",
+    "no_api_key": true
+}

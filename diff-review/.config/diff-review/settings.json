@@ -1,0 +1,10 @@
+{
+  "view": "unified",
+  "wrapLines": true,
+  "scope": "base",
+  "keybindings": {
+    "prev-file": "a",
+    "next-file": "s",
+    "toggle-reviewed": "d"
+  }
+}

@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+
+in_tmux() {
+  [ -n "${TMUX:-}" ]
+}
+
+tmux_running() {
+  tmux ls >/dev/null 2>&1
+}
+
+display_message() {
+  local message="$1"
+  if in_tmux; then
+    tmux display-message "$message"
+  else
+    printf '%s\n' "$message" >&2
+  fi
+}
+
+list_running_sessions() {
+  tmux list-sessions -F "#{session_name}|#{session_windows}" 2>/dev/null || true
+}
+
+format_row() {
+  local name="$1"
+  local windows="$2"
+  local marker="$3"
+  local label
+  label="$(printf '%s %-22s %s windows' "$marker" "$name" "$windows")"
+  printf '%s\t%s\t%s\n' "$name" "$windows" "$label"
+}
+
+list_rows() {
+  local current_session name windows
+  current_session="$(tmux display-message -p '#S' 2>/dev/null || true)"
+
+  # Current session first (will be preselected with --reverse)
+  if [ -n "$current_session" ]; then
+    while IFS='|' read -r name windows; do
+      [ -n "${name:-}" ] || continue
+      if [ "$name" = "$current_session" ]; then
+        format_row "$name" "$windows" "*"
+        break
+      fi
+    done < <(list_running_sessions)
+  fi
+
+  # Remaining sessions sorted alphabetically
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    while IFS='|' read -r n windows; do
+      [ -n "${n:-}" ] || continue
+      if [ "$n" = "$name" ]; then
+        format_row "$name" "$windows" " "
+        break
+      fi
+    done < <(list_running_sessions)
+  done < <(
+    while IFS='|' read -r name _; do
+      [ -n "${name:-}" ] || continue
+      [ "$name" != "$current_session" ] && printf '%s\n' "$name"
+    done < <(list_running_sessions) | sort
+  )
+}
+
+preview_row() {
+  local name="$1"
+  tmux list-windows -t "$name" -F "  #{window_index}: #{window_name} #{?window_active,(active),}" 2>/dev/null || true
+}
+
+handle_selection() {
+  local name="$1"
+  local current_session
+  current_session="$(tmux display-message -p '#S' 2>/dev/null || true)"
+
+  if [ "$name" = "$current_session" ]; then
+    return 0
+  fi
+
+  if in_tmux; then
+    if ! tmux switch-client -t "=$name"; then
+      display_message "Could not switch to session \"$name\""
+    fi
+  else
+    if ! tmux attach-session -t "=$name"; then
+      display_message "Could not attach to session \"$name\""
+    fi
+  fi
+}
+
+delete_selection() {
+  local name="$1"
+  local current_session
+  current_session="$(tmux display-message -p '#S' 2>/dev/null || true)"
+
+  if [ "$name" = "$current_session" ]; then
+    local session_count
+    session_count="$(tmux list-sessions 2>/dev/null | wc -l)"
+    if [ "$session_count" -le 1 ]; then
+      display_message "Cannot kill the only session"
+      return 0
+    fi
+    tmux switch-client -n
+  fi
+
+  if tmux kill-session -t "=$name" 2>/dev/null; then
+    display_message "Killed session \"$name\""
+  else
+    display_message "Could not kill session \"$name\""
+  fi
+}
+
+rename_selection() {
+  local old="$1"
+  local new
+
+  printf '== Rename Session ===\nCurrent: %s\nNew Name -> ' "$old"
+  IFS= read -r new
+
+  [ -n "$new" ] || return 0
+
+  if [ "$new" = "$old" ]; then
+    display_message "Name unchanged"
+    return 0
+  fi
+
+  if session_name_exists "$new"; then
+    display_message "Session name \"$new\" already exists"
+    return 0
+  fi
+
+  if tmux rename-session -t "=$old" "$new" 2>/dev/null; then
+    display_message "Renamed \"$old\" to \"$new\""
+  else
+    display_message "Could not rename session \"$old\""
+  fi
+}
+
+session_name_exists() {
+  local name="$1"
+  tmux has-session -t "=$name" 2>/dev/null
+}
+
+create_new_session_guarded() {
+  local name
+
+  printf '== New tmux Session ===\nSession Name -> '
+  IFS= read -r name
+
+  [ -n "$name" ] || return 0
+
+  if session_name_exists "$name"; then
+    display_message "Session name \"$name\" already exists"
+    return 0
+  fi
+
+  if in_tmux; then
+    if tmux new-session -d -s "$name" 2>/dev/null; then
+      tmux switch-client -t "$name"
+    else
+      display_message "Could not create session \"$name\""
+    fi
+    return 0
+  fi
+
+  if tmux_running; then
+    if tmux new-session -d -s "$name" 2>/dev/null; then
+      tmux attach-session -t "$name"
+    else
+      display_message "Could not create session \"$name\""
+    fi
+    return 0
+  fi
+
+  tmux new-session -s "$name"
+}
+
+interactive_main() {
+  local escaped_script selected name footer_text
+
+  escaped_script="$(printf '%q' "$SCRIPT_PATH")"
+  footer_text="enter: switch | ctrl-n: new
+ctrl-d: kill | ctrl-r: rename"
+
+  selected="$(list_rows | fzf --reverse \
+      --delimiter=$'\t' \
+      --with-nth=3 \
+      --prompt='-> ' \
+      --footer="$footer_text" \
+      --border=rounded \
+      --border-label=' Session Switcher ' \
+      --input-border=rounded \
+      --input-label=' Select Session ' \
+      --color='footer:italic' \
+      --preview="$escaped_script __preview {1}" \
+      --preview-window='right:45%:wrap' \
+      --bind="ctrl-d:execute-silent($escaped_script __delete {1})+reload($escaped_script __list)" \
+      --bind="ctrl-r:execute($escaped_script __rename {1})+reload($escaped_script __list)" \
+      --bind="ctrl-n:execute($escaped_script __new)+abort" \
+      --info=inline \
+      --layout=reverse)" || return 0
+
+  name="$(printf '%s' "$selected" | cut -f1)"
+  handle_selection "$name"
+}
+
+print_help() {
+  cat <<'EOF'
+Usage:
+  tmux-manager            # interactive session manager
+  tmux-manager -h|--help  # show this help
+
+Keys:
+  enter    switch to selected session
+  ctrl-n   create new session
+  ctrl-d   kill selected session
+  ctrl-r   rename selected session
+EOF
+}
+
+case "${1-}" in
+  __list)
+    list_rows
+    ;;
+  __preview)
+    preview_row "${2-}"
+    ;;
+  __delete)
+    delete_selection "${2-}"
+    ;;
+  __rename)
+    rename_selection "${2-}"
+    ;;
+  __new)
+    create_new_session_guarded
+    ;;
+  -h|--help|help)
+    print_help
+    ;;
+  "")
+    interactive_main
+    ;;
+  *)
+    print_help >&2
+    exit 1
+    ;;
+esac

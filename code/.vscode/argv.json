@@ -1,0 +1,9 @@
+// This configuration file allows you to pass permanent command line arguments to VS Code.
+
+{
+    "disable-color-correct-rendering": true,
+    "enable-crash-reporter": false,
+    "crash-reporter-id": "31eb76c9-3967-4adc-9ff8-e407e911d71d",
+    "locale": "en",
+    "password-store": "gnome-libsecret"
+}

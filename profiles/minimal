@@ -1,0 +1,4 @@
+# A shell and the tools its config actually calls. Smallest useful set.
+bat
+git
+zsh

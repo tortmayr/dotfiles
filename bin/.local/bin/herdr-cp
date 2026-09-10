@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+#
+# herdr-cp — a command palette for herdr.
+#
+# Meant to be launched from a herdr keybinding as a temporary pane
+# (`[[keys.command]]` with type = "pane"), it shows an fzf menu of known
+# commands and runs the one you pick. The temporary pane closes when this
+# script exits, dropping you back wherever the command left you.
+#
+#   herdr-cp            # show the palette
+#
+# Commands are an ordered registry of "Label<TAB>handler<TAB>guard" rows (see
+# _cp_registry). To add one: write a `_cp_*` handler and add a row; an optional
+# guard function in the third column gates visibility (empty = always shown).
+# The first visible row is the default-highlighted entry.
+#
+# Context: the palette reads the current pane's directory from $PWD — a herdr
+# `type = "pane"` command inherits the active pane's cwd. $CP_REPO_ROOT holds
+# that directory's git repo root (empty when not in a repo); _cp_in_repo gates
+# the repo-scoped commands on it.
+#
+# Library code lives in $SCRIPT_LIBRARY_DIR (herdr.sh -> herdrWs, git.sh ->
+# selectGit). selectGit picks a git repo under $USER_GIT_DIR (New workspace).
+#
+# Requires: herdr, fzf, jq, fd (and the libs above).
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+source "$SCRIPT_LIBRARY_DIR/herdr.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_LIBRARY_DIR/git.sh"
+
+TAB=$'\t'
+CP_REPO_ROOT=""   # git root of the current pane's $PWD; set in main()
+
+# --- command registry --------------------------------------------------------
+# Ordered "Label<TAB>handler<TAB>guard" rows. Order here == order in the palette.
+# Third column is an optional guard function (empty = always shown).
+_cp_registry=(
+  "New workspace${TAB}_cp_new_workspace${TAB}"
+  "Create worktree${TAB}_cp_create_worktree${TAB}_cp_in_repo"
+  "Open worktree${TAB}_cp_open_worktree${TAB}_cp_in_repo"
+)
+
+# --- shared helpers ----------------------------------------------------------
+
+_cp_err() { printf 'herdr-cp: %s\n' "$*" >&2; }
+
+# Print a message and wait for a keypress before returning. The palette runs in
+# a temporary pane that closes the moment the command exits, so a plain stderr
+# message would vanish before it can be read. Use this for any message the user
+# must actually see (empty lists, validation errors, failures). Reads the key
+# from /dev/tty (not stdin, which a handler may have consumed) and only blocks
+# when attached to a terminal, so non-interactive callers (tests) don't hang.
+_cp_notice() {
+  local key
+  _cp_err "$*"
+  [ -t 1 ] || return 0
+  printf 'herdr-cp: press any key to exit' >&2
+  read -rsn1 key </dev/tty 2>/dev/null || true
+  printf '\n' >&2
+}
+
+# Guard: true when the current pane's directory is inside a git repo.
+_cp_in_repo() { [ -n "$CP_REPO_ROOT" ]; }
+
+# Read herdr JSON from stdin, extract the created/opened workspace id, focus it.
+_cp_focus_from_json() {
+  local ws
+  ws=$(jq -r '.result.workspace.workspace_id // empty')
+  [ -n "$ws" ] || { _cp_notice "could not read workspace id"; return 1; }
+  herdr workspace focus "$ws" >/dev/null 2>&1
+}
+
+# --- command handlers --------------------------------------------------------
+
+# New workspace: pick a git repo, ensure a workspace for it, and switch to it.
+_cp_new_workspace() {
+  local dir ws
+  dir=$(selectGit) || return 0
+  [ -n "$dir" ] || return 0          # Esc / no selection -> abort quietly
+
+  ws=$(herdrWs "$dir") || { _cp_notice "could not create or reuse a workspace for $dir"; return 1; }
+  herdr workspace focus "$ws" >/dev/null 2>&1
+}
+
+# Create worktree (current repo): type a NEW branch name, create a worktree
+# (herdr places it under ~/Git/worktrees/<repo>/<branch>, branched off the
+# repo's current HEAD) and switch to its workspace. The branch must not exist.
+_cp_create_worktree() {
+  local branch out
+  read -rp 'new branch: ' branch || return 0
+  [ -n "$branch" ] || return 0
+
+  if git -C "$CP_REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+    _cp_notice "branch already exists: $branch"; return 1
+  fi
+
+  out=$(herdr worktree create --cwd "$CP_REPO_ROOT" --branch "$branch" --no-focus --json 2>/dev/null) \
+    || { _cp_notice "worktree create failed for '$branch'"; return 1; }
+  printf '%s' "$out" | _cp_focus_from_json
+}
+
+# Open worktree (current repo): pick one of the repo's existing linked
+# worktrees, open its workspace and switch to it.
+_cp_open_worktree() {
+  local list sel path out
+  list=$(herdr worktree list --cwd "$CP_REPO_ROOT" --json 2>/dev/null \
+    | jq -r '.result.worktrees[]? | select(.is_linked_worktree == true) | "\(.branch)\t\(.path)"')
+  if [ -z "$list" ]; then
+    _cp_notice "no linked worktrees for $(basename "$CP_REPO_ROOT")"; return 0
+  fi
+
+  sel=$(printf '%s\n' "$list" \
+    | fzf --prompt 'worktree ❯ ' --with-nth=1 --delimiter="$TAB" --height=40% --reverse) \
+    || return 0
+  [ -n "$sel" ] || return 0
+  path=${sel#*"$TAB"}
+
+  out=$(herdr worktree open --cwd "$CP_REPO_ROOT" --path "$path" --no-focus --json 2>/dev/null) \
+    || { _cp_notice "worktree open failed"; return 1; }
+  printf '%s' "$out" | _cp_focus_from_json
+}
+
+# --- palette -----------------------------------------------------------------
+
+main() {
+  # Resolve the current pane's repo root once; guards key off it.
+  CP_REPO_ROOT=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || CP_REPO_ROOT=""
+
+  # Build the visible rows: keep "Label<TAB>handler", dropping any row whose
+  # guard function (third column) is present and fails.
+  local rows=() row label handler guard
+  for row in "${_cp_registry[@]}"; do
+    IFS=$TAB read -r label handler guard <<<"$row"
+    [ -z "$guard" ] || "$guard" || continue
+    rows+=("${label}${TAB}${handler}")
+  done
+  [ "${#rows[@]}" -gt 0 ] || return 0
+
+  local selection
+  selection=$(printf '%s\n' "${rows[@]}" \
+    | fzf --prompt 'herdr ❯ ' \
+          --with-nth=1 --delimiter="$TAB" \
+          --height=40% --reverse) || return 0   # Esc -> exit cleanly
+  [ -n "$selection" ] || return 0
+
+  handler=${selection#*"$TAB"}
+  "$handler"
+}
+
+main "$@"

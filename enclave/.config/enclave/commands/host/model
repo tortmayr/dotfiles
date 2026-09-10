@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+	cat <<'EOF'
+Usage:
+  enclave model <model-name> [effort-level] [--tool <tool>]
+  enclave model --list [search] [--tool <tool>]
+
+Start an agent with invocation-specific model and reasoning settings, or list
+models available to the selected harness.
+
+Supported tools:
+  claude  Pass effort with --effort
+  codex   Pass effort as the model_reasoning_effort config override
+  pi      Pass effort with --thinking
+
+The tool defaults to claude when omitted.
+
+Examples:
+  enclave model fable
+  enclave model fable high
+  enclave model fable high --tool claude
+  enclave model gpt-5.3-codex high --tool codex
+  enclave model anthropic/claude-opus-4-6 high --tool pi
+  enclave model --list
+  enclave model --list --tool codex
+  enclave model --list sonnet --tool pi
+EOF
+}
+
+die() {
+	printf 'enclave model: %s\n' "$*" >&2
+	exit 2
+}
+
+list=false
+tool=claude
+positionals=()
+while (($# > 0)); do
+	case "$1" in
+		-h | --help)
+			usage
+			exit 0
+			;;
+		--list)
+			list=true
+			;;
+		--tool)
+			(($# >= 2)) || die '--tool requires a value'
+			tool=$2
+			shift 2
+			continue
+			;;
+		--tool=*)
+			tool=${1#--tool=}
+			[[ -n $tool ]] || die '--tool requires a value'
+			;;
+		--)
+			shift
+			positionals+=("$@")
+			break
+			;;
+		-*)
+			die "unknown option: $1"
+			;;
+		*)
+			positionals+=("$1")
+			;;
+	esac
+	shift
+done
+
+[[ -n ${ENCLAVE_BIN:-} ]] || die 'ENCLAVE_BIN is not set'
+
+case "$tool" in
+	claude | codex | pi) ;;
+	*) die "unsupported tool: $tool" ;;
+esac
+
+if $list; then
+	((${#positionals[@]} <= 1)) || die '--list accepts at most one search term'
+	search=${positionals[0]:-}
+
+	case "$tool" in
+		claude)
+			list_script=$(cat <<'EOF'
+set -euo pipefail
+printf '%s\n' '{"type":"control_request","request_id":"models","request":{"subtype":"list_models"}}' |
+	claude --dangerously-skip-permissions \
+		--print \
+		--input-format stream-json \
+		--output-format stream-json \
+		--verbose |
+	jq -r --arg search "$1" '
+		def matches($search):
+			$search == "" or (ascii_downcase | contains($search | ascii_downcase));
+		[.response.response.models[]
+		 | select(((.value // "") + " " + (.resolvedModel // "") + " " + (.displayName // "")) | matches($search))
+		 | [.value, (.resolvedModel // "-"), ((.supportedEffortLevels // []) | join(","))]
+		] as $rows
+		| (["MODEL", "RESOLVED", "EFFORT"] | @tsv),
+		  (if ($rows | length) == 0
+		   then "No models matching \($search)"
+		   else ($rows[] | @tsv)
+		   end)
+	'
+EOF
+)
+			exec "$ENCLAVE_BIN" shell --tool claude -- -lc "$list_script" bash "$search"
+			;;
+		codex)
+			list_script=$(cat <<'EOF'
+set -euo pipefail
+codex --dangerously-bypass-approvals-and-sandbox debug models |
+	jq -r --arg search "$1" '
+		def matches($search):
+			$search == "" or (ascii_downcase | contains($search | ascii_downcase));
+		[.models[]
+		 | select(.visibility == "list")
+		 | select(((.slug // "") + " " + (.display_name // "")) | matches($search))
+		 | [.slug, (.default_reasoning_level // "-"), ([.supported_reasoning_levels[]?.effort] | join(","))]
+		] as $rows
+		| (["MODEL", "DEFAULT EFFORT", "EFFORT LEVELS"] | @tsv),
+		  (if ($rows | length) == 0
+		   then "No models matching \($search)"
+		   else ($rows[] | @tsv)
+		   end)
+	'
+EOF
+)
+			exec "$ENCLAVE_BIN" shell --tool codex -- -lc "$list_script" bash "$search"
+			;;
+		pi)
+			args=(--list-models)
+			[[ -z $search ]] || args+=("$search")
+			exec "$ENCLAVE_BIN" --tool pi -- "${args[@]}"
+			;;
+	esac
+	exit 0
+fi
+
+((${#positionals[@]} >= 1)) || die 'model name is required'
+((${#positionals[@]} <= 2)) || die 'expected a model name and optional effort level'
+
+model=${positionals[0]}
+effort=${positionals[1]:-}
+harness_args=(--model "$model")
+
+case "$tool" in
+	claude)
+		[[ -z $effort ]] || harness_args+=(--effort "$effort")
+		;;
+	codex)
+		[[ -z $effort ]] || harness_args+=(-c "model_reasoning_effort=\"$effort\"")
+		;;
+	pi)
+		[[ -z $effort ]] || harness_args+=(--thinking "$effort")
+		;;
+esac
+
+exec "$ENCLAVE_BIN" --tool "$tool" -- "${harness_args[@]}"

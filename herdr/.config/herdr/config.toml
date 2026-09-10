@@ -1,0 +1,135 @@
+# herdr configuration
+# Keybinds tuned to mirror ~/.tmux.conf as closely as herdr allows.
+# Concept mapping: tmux session -> workspace, tmux window -> tab, tmux pane -> pane.
+# The "default:" comments show herdr's stock value (see: herdr --default-config).
+
+onboarding = false
+
+# --- theme: GitHub Dark Dimmed (Primer palette) --------------------------
+# herdr has no built-in github theme, so we start from a dark base and
+# override every token. Token roles are from src/app/state.rs::Palette.
+[theme]
+name = "tokyo-night"        # dark base; every role below is overridden anyway
+
+[theme.custom]
+# herdr has no dedicated sidebar-fill token: the sidebar's empty area shares the
+# global base background (same as terminal panes). The reference look distinguishes
+# the sidebar/top-bar via VISIBLE dividers, not a different fill. So we frame the
+# chrome with a brighter `panel_bg` (top bar) and a visible `surface_dim` (the
+# borders/separators between the sidebar and the terminal area, plus selected rows).
+accent      = "#539bf5"   # accent.fg      - highlights, active borders
+panel_bg    = "#2d333b"   # canvas.overlay - top bar / floating panels bg
+surface0    = "#373e47"   # border.muted   - selected/focused item bg
+surface1    = "#444c56"   # border.default - hover/active surface
+surface_dim = "#444c56"   # border.default - sidebar/pane dividers (was #1c2128: invisible)
+overlay0    = "#636e7b"   # fg.subtle      - muted secondary text/numbers
+overlay1    = "#768390"   # fg.muted       - brighter overlay text
+text        = "#adbac7"   # fg.default     - main text
+subtext0    = "#909dab"   # neutral.muted  - subdued labels
+mauve       = "#b083f0"   # done.fg        - branch names / special labels
+green       = "#6bc46d"   # success        - done / idle states
+yellow      = "#daaa3f"   # attention      - working / running states
+red         = "#f47067"   # danger         - needs attention / blocked
+blue        = "#539bf5"   # accent.fg      - notification accent
+teal        = "#39c5cf"   # ansi cyan      - unseen markers
+peach       = "#e0823d"   # severe         - interrupted / warning
+
+[keys]
+# tmux had C-b primary + C-a secondary; herdr supports a single prefix.
+prefix = "ctrl+a"                    # default: "ctrl+b"
+
+# --- splits (tmux: `v` = split below, `b` = split right) -----------------
+split_vertical   = "prefix+v"        # default: "prefix+v"      (unchanged)
+split_horizontal = "prefix+b"        # default: "prefix+minus"
+
+# --- pane focus (tmux: Alt+arrow, no prefix) -----------------------------
+focus_pane_left  = "alt+left"        # default: "prefix+h"
+focus_pane_down  = "alt+down"        # default: "prefix+j"
+focus_pane_up    = "alt+up"          # default: "prefix+k"
+focus_pane_right = "alt+right"       # default: "prefix+l"
+
+# --- swap panes (tmux used `,`/`.`; herdr swaps are directional) ---------
+swap_pane_left  = "prefix+shift+left"   # default: "prefix+shift+h"
+swap_pane_down  = "prefix+shift+down"   # default: "prefix+shift+j"
+swap_pane_up    = "prefix+shift+up"     # default: "prefix+shift+k"
+swap_pane_right = "prefix+shift+right"  # default: "prefix+shift+l"
+
+# --- panes: misc ---------------------------------------------------------
+close_pane = "prefix+x"              # default: "prefix+x"       (unchanged)
+zoom       = "prefix+z"              # default: "prefix+z"       (unchanged)
+# tmux resized with Shift+Arrow (repeatable). herdr has no direct resize bind;
+# enter resize mode with prefix+r, then use arrows/hjkl, esc to exit.
+resize_mode = "prefix+r"             # default: "prefix+r"       (unchanged)
+copy_mode   = "prefix+["             # default: "prefix+["       (unchanged)
+
+# --- tabs (tmux windows) -------------------------------------------------
+new_tab       = "prefix+c"           # default: "prefix+c"       (unchanged)
+previous_tab  = "prefix+p"           # default: "prefix+p"       (unchanged)
+next_tab      = "prefix+n"           # default: "prefix+n"       (unchanged)
+switch_tab    = "prefix+1..9"        # default: "prefix+1..9"    (unchanged)
+rename_tab    = "prefix+shift+t"     # default: "prefix+shift+t" (unchanged)
+close_tab     = "prefix+shift+x"     # default: "prefix+shift+x" (unchanged)
+
+# --- workspaces (tmux sessions) ------------------------------------------
+workspace_picker = "prefix+s"        # default: "prefix+w"       (tmux `s` session mgr)
+new_workspace    = "prefix+shift+s"  # default: "prefix+shift+n" (tmux `S` new-session)
+close_workspace  = "prefix+shift+k"  # default: "prefix+shift+d" (tmux `K` kill-session)
+rename_workspace = "prefix+shift+w"  # default: "prefix+shift+w" (unchanged)
+new_worktree     = "prefix+shift+g"  # default: "prefix+shift+g" (unchanged, tmux `G`)
+
+# --- relocated defaults (their tmux keys are reused above) ---------------
+toggle_sidebar  = "prefix+shift+b"     # default: "prefix+b"     (b -> split)
+goto            = "prefix+f"           # default: "prefix+g"     (g -> lazygit)
+edit_scrollback = "prefix+shift+e"     # default: "prefix+e"     (e -> VS Code)
+settings        = "prefix+shift+comma" # default: "prefix+s"     (s -> workspace_picker)
+
+# --- navigate-mode local movement (all unchanged from defaults) ----------
+navigate_workspace_up   = "up"       # default: "up"
+navigate_workspace_down = "down"     # default: "down"
+navigate_pane_left      = "h"        # default: "h"
+navigate_pane_down      = "j"        # default: "j"
+navigate_pane_up        = "k"        # default: "k"
+navigate_pane_right     = "l"        # default: "l"
+
+# --- custom commands (tmux popups) ---------------------------------------
+# No herdr defaults exist for these; they are extra bindings.
+# tmux: bind g -> lazygit popup
+[[keys.command]]
+key = "prefix+g"
+type = "pane"
+command = "exec lazygit"
+description = "lazygit"
+
+# tmux: bind e -> open current dir in VS Code
+[[keys.command]]
+key = "prefix+e"
+type = "shell"
+command = 'code "$HERDR_ACTIVE_PANE_CWD"'
+description = "open VS Code in pane cwd"
+
+# command palette: fzf menu of known commands (see herdr-cp bin)
+[[keys.command]]
+key = "prefix+space"
+type = "pane"
+command = "exec herdr-cp"
+description = "command palette"
+
+[[keys.command]]
+key = "ctrl+space"
+type = "pane"
+command = "exec herdr-cp"
+description = "command palette (ctrl+space)"
+
+[ui]
+show_agent_labels_on_pane_borders = true
+prompt_new_tab_name = false
+pane_borders = true
+pane_gaps = false
+agent_panel_sort = "spaces"
+
+[experimental]
+pane_history = false
+kitty_graphics = true
+
+[worktrees]
+directory = "~/Git/worktrees"

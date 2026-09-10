@@ -1,0 +1,13 @@
+# Agent containers and remote shells: a usable terminal, nothing that needs a
+# desktop, an editor GUI or a display.
+#
+# The agent configs (claude, codex, pi) are deliberately absent: enclave and
+# comparable sandboxes compose the tool's config themselves from their own
+# stores, and a baked ~/.claude/settings.json would collide with that.
+bash
+bat
+bin
+git
+lazygit
+tmux
+zsh

@@ -1,0 +1,50 @@
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+service_tier = "default"
+file_opener = "vscode"
+# Disable analytics/telemetry
+[analytics]
+enabled = false
+
+# Disable feedback collection
+[feedback]
+enabled = false
+
+# Disable OTEL (OpenTelemetry) telemetry/tracing
+[otel]
+exporter = "none"
+trace_exporter = "none"
+log_user_prompt = false
+
+# Disable update checks (phones home to check for updates)
+check_for_update_on_startup = false
+
+# Disable personality feature (interferes with agent behaviour)
+personality = "none"
+
+
+[features]
+hooks = true
+personality = false
+multi_agent = true
+undo = true
+
+[tui]
+status_line = ["model-with-reasoning", "current-dir", "git-branch", "context-used", "five-hour-limit", "weekly-limit", "used-tokens", "reasoning", "fast-mode"]
+status_line_use_colors = true
+
+[tui.model_availability_nux]
+"gpt-5.5" = 4
+"gpt-5.6-sol" = 4
+gpt-6-astra = 4
+
+[notice]
+fast_default_opt_out = true
+
+[notice.model_migrations]
+"gpt-5.2-codex" = "gpt-5.3-codex"
+
+# Codex appends machine state below this line as you trust projects:
+# [hooks.state] and [projects."<absolute path>"] entries. Those are
+# per-machine and contain local (sometimes client) paths — never commit
+# them. CI fails the build if they reach this repository.

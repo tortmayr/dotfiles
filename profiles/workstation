@@ -1,0 +1,20 @@
+# Everything portable. A Linux workstation with a desktop, editors and agents.
+# The machine-specific overlay (identity, monitors, client projects) lives in a
+# separate private repository and is stowed on top of this.
+ai-review
+bash
+bat
+bin
+claude
+code
+codex
+diff-review
+enclave
+git
+herdr
+kitty
+lazygit
+pi
+profile
+tmux
+zsh

@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+
+
+# npm script runner with fzf selection and monorepo support
+# Usage: nr
+
+declare -g git_root is_monorepo root_package_json pkg_manager cached_workspace_packages
+
+find_git_root() {
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git rev-parse --show-toplevel
+}
+
+detect_package_manager() {
+    local check_dir="$1"
+    
+    if [ -f "$check_dir/pnpm-lock.yaml" ]; then
+        echo "pnpm"
+    elif [ -f "$check_dir/yarn.lock" ]; then
+        echo "yarn"
+    elif [ -f "$check_dir/package-lock.json" ]; then
+        echo "npm"
+    else
+        echo "npm"
+    fi
+}
+
+get_package_name() {
+    local package_json="$1"
+    local default="${2:-unknown}"
+    
+    local name=$(jq -r '.name // empty' "$package_json" 2>/dev/null)
+    if [ -z "$name" ] || [ "$name" = "null" ]; then
+        echo "$default"
+    else
+        echo "$name"
+    fi
+}
+
+get_scripts() {
+    local package_json="$1"
+    jq -r '.scripts | keys[]' "$package_json" 2>/dev/null
+}
+
+# Get workspace packages using package manager native commands (cached for performance)
+get_workspace_packages() {
+    local root_package="$1"
+    
+    if [ -n "$cached_workspace_packages" ]; then
+        echo "$cached_workspace_packages"
+        return
+    fi
+    
+    local git_root=$(dirname "$root_package")
+    local result=""
+    
+    local root_name=$(get_package_name "$root_package" "root")
+    result="$root_name:$git_root"
+    
+    # Use package manager specific commands to get workspace locations
+    local workspace_locations=""
+    case "$pkg_manager" in
+        "npm")
+            workspace_locations=$(cd "$git_root" && npm query .workspace 2>/dev/null | jq -r '.[].location' 2>/dev/null)
+            ;;
+        "yarn")
+            workspace_locations=$(cd "$git_root" && yarn workspaces info 2>/dev/null | tail -n +2 | head -n -1 | jq -r 'to_entries[] | .value.location' 2>/dev/null)
+            ;;
+        "pnpm")
+            workspace_locations=$(cd "$git_root" && pnpm m ls --depth -1 --json 2>/dev/null | jq -r '.[].path' 2>/dev/null)
+            ;;
+    esac
+    
+    if [ -n "$workspace_locations" ]; then
+        while IFS= read -r location; do
+            if [ -n "$location" ] && [ "$location" != "null" ]; then
+                # Handle absolute paths (pnpm) vs relative paths (npm/yarn)
+                local workspace_dir
+                if [[ "$location" = /* ]]; then
+                    workspace_dir="$location"
+                else
+                    workspace_dir="$git_root/$location"
+                fi
+                
+                if [ -f "$workspace_dir/package.json" ]; then
+                    local name=$(get_package_name "$workspace_dir/package.json")
+                    if [ -n "$name" ] && [ "$name" != "null" ]; then
+                        result="$result"$'\n'"$name:$workspace_dir"
+                    fi
+                fi
+            fi
+        done <<< "$workspace_locations"
+    fi
+    
+    cached_workspace_packages="$result"
+    echo "$result"
+}
+
+build_command_chain() {
+    local -a scripts=("$@")
+    local command=""
+    
+    for i in "${!scripts[@]}"; do
+        local script_cmd="$pkg_manager run ${scripts[$i]}"
+        if [ $i -eq 0 ]; then
+            command="$script_cmd"
+        else
+            command="$command && $script_cmd"
+        fi
+    done
+    
+    echo "$command"
+}
+
+execute_command() {
+    local package_dir="$1"
+    local command="$2"
+    
+    local full_command
+    if [ "$package_dir" != "$(pwd)" ]; then
+        full_command="cd $package_dir && $command"
+    else
+        full_command="$command"
+    fi
+    
+    read -e -i "$full_command" edited_command
+    
+    if [ -n "$edited_command" ]; then
+        echo "Running: $edited_command"
+        eval "$edited_command"
+    fi
+}
+
+run_fzf() {
+    local data="$1"
+    local prompt="$2"
+    local header="$3"
+    local extra_bindings="$4"
+    
+    local fzf_cmd="fzf --multi --prompt='$prompt' --header-lines=1 --height=40% --border"
+    if [ -n "$extra_bindings" ]; then
+        fzf_cmd="$fzf_cmd $extra_bindings"
+    fi
+    
+    echo -e "$header\n$data" | eval "$fzf_cmd"
+}
+
+build_fzf_bindings() {
+    local header="$1"
+    local scripts="$2"
+    
+    if [ "$is_monorepo" = "true" ] && [ -n "$cached_workspace_packages" ]; then
+        local package_names=$(echo "$cached_workspace_packages" | cut -d: -f1)
+        local packages_data=$(echo -e "Choose package\n$package_names" | sed 's/"/\\"/g')
+        local scripts_data=$(echo -e "$header\n$scripts" | sed 's/"/\\"/g')
+        
+        echo "--bind='ctrl-s:reload(printf \"%s\" \"$packages_data\")+change-prompt(Select package: )' --bind='ctrl-d:reload(printf \"%s\" \"$scripts_data\")+change-prompt(Select script(s): )'"
+    fi
+}
+
+show_package_scripts() {
+    local package_dir="$1"
+    local package_json="$package_dir/package.json"
+    
+    if [ ! -f "$package_json" ]; then
+        echo "Error: No package.json found in $package_dir"
+        return 1
+    fi
+    
+    # Use "root" as default for monorepo root packages
+    local package_name
+    if [ "$is_monorepo" = "true" ] && [ "$package_dir" = "$git_root" ]; then
+        package_name=$(get_package_name "$package_json" "root")
+    else
+        package_name=$(get_package_name "$package_json")
+    fi
+    
+    local scripts=$(get_scripts "$package_json")
+    if [ -z "$scripts" ]; then
+        echo "No scripts found in $package_json"
+        return 1
+    fi
+    
+    local header="$package_name"
+    if [ "$is_monorepo" = "true" ]; then
+        header="$package_name (Ctrl+s: Package selection)"
+    fi
+    
+    local extra_bindings=$(build_fzf_bindings "$header" "$scripts")
+    local fzf_output=$(run_fzf "$scripts" "Select script(s): " "$header" "$extra_bindings")
+    
+    if [ -z "$fzf_output" ]; then
+        return 0
+    fi
+    
+    # Check if a package was selected (from Ctrl+S package switching)
+    if [ "$is_monorepo" = "true" ] && [ -n "$cached_workspace_packages" ]; then
+        while IFS= read -r option; do
+            local selected_dir=$(echo "$cached_workspace_packages" | grep "^$option:" | cut -d: -f2)
+            if [ -n "$selected_dir" ]; then
+                show_package_scripts "$selected_dir"
+                return
+            fi
+        done <<< "$fzf_output"
+    fi
+    
+    # Process selected scripts
+    local -a script_array
+    while IFS= read -r script; do
+        if [ -n "$script" ]; then
+            script_array+=("$script")
+        fi
+    done <<< "$fzf_output"
+    
+    if [ ${#script_array[@]} -eq 0 ]; then
+        return 1
+    fi
+    
+    local command=$(build_command_chain "${script_array[@]}")
+    execute_command "$package_dir" "$command"
+}
+
+show_package_list() {
+    local workspace_packages=$(get_workspace_packages "$root_package_json")
+    if [ -z "$workspace_packages" ]; then
+        echo "No workspace packages found"
+        return 1
+    fi
+    
+    local package_names=$(echo "$workspace_packages" | cut -d: -f1)
+    local selected=$(echo -e "Choose package\n$package_names" | fzf --prompt="Select package: " --header-lines=1 --height=40% --border)
+    
+    if [ -n "$selected" ]; then
+        local selected_dir=$(echo "$workspace_packages" | grep "^$selected:" | cut -d: -f2)
+        show_package_scripts "$selected_dir"
+    fi
+}
+
+check_dependencies() {
+    command -v fzf >/dev/null || { echo "Error: fzf is not installed"; exit 1; }
+    command -v jq >/dev/null || { echo "Error: jq is not installed"; exit 1; }
+}
+
+init_globals() {
+    git_root=$(find_git_root)
+    is_monorepo="false"
+    root_package_json=""
+    pkg_manager=""
+    cached_workspace_packages=""
+    
+    if [ -n "$git_root" ] && [ -f "$git_root/package.json" ]; then
+        root_package_json="$git_root/package.json"
+        if jq -e '.workspaces' "$root_package_json" >/dev/null 2>&1; then
+            is_monorepo="true"
+            pkg_manager=$(detect_package_manager "$git_root")
+        fi
+    fi
+    
+    if [ "$is_monorepo" = "false" ]; then
+        pkg_manager=$(detect_package_manager "$(pwd)")
+    fi
+}
+
+main() {
+    check_dependencies
+    init_globals
+    
+    if [ "$is_monorepo" = "true" ]; then
+        # Pre-cache workspace packages for performance
+        get_workspace_packages "$root_package_json" >/dev/null
+        
+        if [ -f "package.json" ]; then
+            show_package_scripts "$(pwd)"
+        else
+            show_package_list
+        fi
+    else
+        if [ ! -f "package.json" ]; then
+            echo "Error: No package.json found"
+            exit 1
+        fi
+        show_package_scripts "$(pwd)"
+    fi
+}
+
+main "$@"

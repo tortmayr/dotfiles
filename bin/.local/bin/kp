@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+
+
+# Function to free up the specified port by killing the blocking process
+killPort() {
+  local port=$1
+  local force=$2
+  
+  # Check if the port is provided
+  if [ -z "$port" ]; then
+    echo "Usage: killPort [-f] <port_number>"
+    return 1
+  fi
+  
+  # Find the process occupying the specified port
+  local pid
+  pid=$(lsof -i :"$port" -sTCP:LISTEN -t | head -n 1)
+
+  if [ -z "$pid" ]; then
+    echo "No process found occupying port $port."
+    return 0
+  fi
+
+  local process_name
+  process_name=$(ps -p "$pid" -o comm=)
+
+  if [ "$force" != "true" ]; then
+    read -p "Kill process $pid ($process_name) on port $port? (y/n): " answer
+    if [[ "$answer" != "y" ]]; then
+      echo "Aborted. Port $port is still occupied."
+      return 0
+    fi
+  fi
+
+  kill -9 "$pid"
+  echo "Killed $pid ($process_name). Port $port is now free."
+}
+
+# Parse command line arguments
+force="false"
+while getopts "f" opt; do
+  case $opt in
+    f)
+      force="true"
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND -1))
+
+# Check if script is called with an argument
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  killPort "$1" "$force"
+fi

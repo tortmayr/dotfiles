@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 EclipseSource GmbH and others.
+#
+# This program and the accompanying materials are made available under the
+# terms of the MIT License, which is available in the project root.
+#
+# SPDX-License-Identifier: MIT
+
+# Run ccusage against persisted Enclave agent sessions. Install or symlink this
+# file as ~/.config/enclave/commands/host/usage to expose `enclave usage`.
+set -euo pipefail
+
+usage() {
+	cat <<'EOF'
+Usage: enclave usage [WRAPPER OPTIONS] [CCUSAGE ARGUMENTS...]
+
+Run ccusage over persisted Enclave sessions. Arguments not listed below are
+passed to ccusage unchanged; without arguments ccusage's default daily report
+is used.
+
+Wrapper options:
+  -H, --include-host  Also include ordinary host sessions
+      --enclave-only  Include only Enclave sessions (default)
+      --show-paths    Print discovered native data roots and exit
+  -h, --help          Show this help (only recognized as the first argument)
+
+Examples:
+  enclave usage monthly
+  enclave usage monthly --json --by-agent
+  enclave usage --include-host monthly
+  enclave usage --show-paths
+
+EOF
+}
+
+die() {
+	printf 'enclave usage: %s\n' "$*" >&2
+	exit 1
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+include_host=false
+show_paths=false
+forwarded=()
+while (($# > 0)); do
+	case "$1" in
+		-H | --include-host)
+			include_host=true
+			;;
+		--enclave-only)
+			include_host=false
+			;;
+		--show-paths)
+			show_paths=true
+			;;
+		--)
+			shift
+			forwarded+=("$@")
+			break
+			;;
+		*)
+			forwarded+=("$1")
+			;;
+	esac
+	shift
+done
+
+host_home=${HOME:-}
+[[ -n $host_home ]] || die 'HOME is not set'
+[[ $host_home == /* ]] || die "HOME must be an absolute path: $host_home"
+
+if [[ $(uname -s) == "Darwin" ]]; then
+	state_root="$host_home/Library/Application Support/org.eclipse.enclave/state"
+elif [[ ${XDG_STATE_HOME:-} == /* ]]; then
+	state_root="$XDG_STATE_HOME/enclave"
+else
+	state_root="$host_home/.local/state/enclave"
+fi
+
+scratch_dir=$(mktemp -d "${TMPDIR:-/tmp}/enclave-ccusage.XXXXXX")
+cleanup() {
+	if [[ -n ${scratch_dir:-} && -d $scratch_dir ]]; then
+		rm -rf -- "$scratch_dir"
+	fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+claude_paths=()
+codex_paths=()
+gemini_paths=()
+pi_paths=()
+
+validate_path() {
+	local path=$1
+	[[ $path != *","* ]] || die "ccusage cannot represent a data path containing a comma: $path"
+	[[ $path != *$'\n'* && $path != *$'\r'* ]] || die 'data paths must not contain newlines'
+}
+
+canonical_dir() {
+	(cd -- "$1" >/dev/null 2>&1 && pwd -P)
+}
+
+append_claude_root() {
+	local root=$1 canonical existing
+	[[ -d "$root/projects" ]] || return 1
+	validate_path "$root"
+	canonical=$(canonical_dir "$root")
+	validate_path "$canonical"
+	for existing in "${claude_paths[@]-}"; do
+		[[ $existing != "$canonical" ]] || return 0
+	done
+	claude_paths+=("$canonical")
+}
+
+append_codex_root() {
+	local root=$1 canonical existing
+	[[ -d "$root/sessions" || -d "$root/archived_sessions" ]] || return 1
+	validate_path "$root"
+	canonical=$(canonical_dir "$root")
+	validate_path "$canonical"
+	for existing in "${codex_paths[@]-}"; do
+		[[ $existing != "$canonical" ]] || return 0
+	done
+	codex_paths+=("$canonical")
+}
+
+append_gemini_root() {
+	local root=$1 canonical existing
+	[[ -d $root ]] || return 1
+	validate_path "$root"
+	canonical=$(canonical_dir "$root")
+	validate_path "$canonical"
+	for existing in "${gemini_paths[@]-}"; do
+		[[ $existing != "$canonical" ]] || return 0
+	done
+	gemini_paths+=("$canonical")
+}
+
+append_pi_root() {
+	local root=$1 canonical existing
+	[[ -d $root ]] || return 1
+	validate_path "$root"
+	canonical=$(canonical_dir "$root")
+	validate_path "$canonical"
+	for existing in "${pi_paths[@]-}"; do
+		[[ $existing != "$canonical" ]] || return 0
+	done
+	pi_paths+=("$canonical")
+}
+
+shopt -s nullglob
+for root in "$state_root"/projects/*/claude/config-store/*; do
+	append_claude_root "$root" || true
+done
+for root in "$state_root"/projects/*/codex/config-store/*; do
+	append_codex_root "$root" || true
+done
+for root in "$state_root"/projects/*/gemini/config-store/*/tmp; do
+	append_gemini_root "$root" || true
+done
+for root in "$state_root"/projects/*/pi/config-store/*/agent/sessions; do
+	append_pi_root "$root" || true
+done
+shopt -u nullglob
+
+if $include_host; then
+	# Add the agents' ordinary host locations. Exact and symlinked duplicates
+	# are removed.
+	append_claude_root "$host_home/.config/claude" || true
+	append_claude_root "$host_home/.claude" || true
+	append_codex_root "$host_home/.codex" || true
+	append_gemini_root "$host_home/.gemini/tmp" || true
+	append_pi_root "$host_home/.pi/agent/sessions" || true
+fi
+
+print_roots() {
+	local label=$1
+	shift
+	printf '%s:\n' "$label"
+	if (($# == 0)); then
+		printf '  (none)\n'
+		return
+	fi
+	printf '  %s\n' "$@"
+}
+
+if $show_paths; then
+	if $include_host; then
+		printf 'Mode: Enclave and host\n'
+	else
+		printf 'Mode: Enclave only\n'
+	fi
+	printf 'State root: %s\n' "$state_root"
+	print_roots Claude "${claude_paths[@]}"
+	print_roots Codex "${codex_paths[@]}"
+	print_roots Gemini "${gemini_paths[@]}"
+	print_roots Pi "${pi_paths[@]}"
+	exit 0
+fi
+
+# An explicit, valid empty root prevents ccusage from falling back to ordinary
+# host data when an Enclave agent has no persisted sessions.
+mkdir -p \
+	"$scratch_dir/empty/claude/projects" \
+	"$scratch_dir/empty/codex/sessions" \
+	"$scratch_dir/empty/gemini" \
+	"$scratch_dir/empty/pi"
+((${#claude_paths[@]} > 0)) || claude_paths+=("$scratch_dir/empty/claude")
+((${#codex_paths[@]} > 0)) || codex_paths+=("$scratch_dir/empty/codex")
+((${#gemini_paths[@]} > 0)) || gemini_paths+=("$scratch_dir/empty/gemini")
+((${#pi_paths[@]} > 0)) || pi_paths+=("$scratch_dir/empty/pi")
+
+join_csv() {
+	local IFS=,
+	printf '%s' "$*"
+}
+
+claude_csv=$(join_csv "${claude_paths[@]}")
+codex_csv=$(join_csv "${codex_paths[@]}")
+gemini_csv=$(join_csv "${gemini_paths[@]}")
+pi_csv=$(join_csv "${pi_paths[@]}")
+
+command -v npx >/dev/null 2>&1 || die 'npx is not available'
+ccusage_command=(npx --yes --cache "$host_home/.npm" ccusage@20.0.17)
+
+run_ccusage() {
+	export CLAUDE_CONFIG_DIR=$claude_csv
+	export CODEX_HOME=$codex_csv
+	export GEMINI_DATA_DIR=$gemini_csv
+	export PI_AGENT_DIR=$pi_csv
+
+	if ! $include_host; then
+		# Unified ccusage reports auto-detect many agents. Isolate all default
+		# home/XDG locations so Enclave-only means Enclave-only, not merely
+		# "custom paths for four agents".
+		export HOME="$scratch_dir/home"
+		export XDG_CONFIG_HOME="$HOME/.config"
+		export XDG_DATA_HOME="$HOME/.local/share"
+		export XDG_STATE_HOME="$HOME/.local/state"
+		export XDG_CACHE_HOME="$HOME/.cache"
+		mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+
+		unset \
+			AMP_DATA_DIR CODEBUFF_DATA_DIR DROID_SESSIONS_DIR GOOSE_PATH_ROOT \
+			HERMES_HOME KILO_DATA_DIR KIMI_DATA_DIR OPENCLAW_DIR \
+			OPENCODE_DATA_DIR QWEN_DATA_DIR
+
+	fi
+
+	"${ccusage_command[@]}" "${forwarded[@]}"
+}
+
+run_ccusage

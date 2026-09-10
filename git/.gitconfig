@@ -1,0 +1,78 @@
+# Portable git configuration. Identity (name, email, signing key) and any
+# machine-local overrides come from the include at the end of this file;
+# the private overlay repository supplies it.
+[merge]
+	tool = kdiff3
+
+[diff]
+	guitool = kdiff3
+	algorithm = histogram
+	colorMoved = plain
+	mnemonicPrefix = true
+	renames = true
+[http]
+	sslVerify = false
+[init]
+	defaultBranch = main
+[credential]
+	helper = store
+[commit]
+	gpgsign = true
+[gpg]
+	program = gpg
+	format = ssh
+[tag]
+	forceSignAnnotated = true
+	sort = version:refname
+[credential "https://github.com"]
+	helper = 
+	helper = !/usr/bin/gh auth git-credential
+[credential "https://gist.github.com"]
+	helper = 
+	helper = !/usr/bin/gh auth git-credential
+[color]
+	ui = auto
+[alias]
+	alias = config --get-regexp ^alias\\.
+	r = reset --hard
+	ru = reset --hard @{upstream}
+	fru = !sh -c 'git fetch && git ru'
+	can = commit --amend --no-edit
+	rs = reset --soft HEAD^
+	ls = status --porcelain
+	l = log --pretty=oneline
+	u = reset HEAD --
+	ll = log -1 HEAD
+	pushGerrit = push origin HEAD:refs/for/master
+	rmMerged = branch --merged | git branch --merged | egrep -v \"(^\\*|master|main)\"
+	scrub = clean -xdf -e .worktrees/
+[mergetool "kdiff3"]
+	path = /usr/bin/kdiff3
+	trustExitCode = false
+[mergetool]
+	prompt = false
+[difftool "kdiff3"]
+	path = /usr/bin/kdiff3
+	trustExitCode = false
+[difftool]
+	prompt = false
+[filter "lfs"]
+	clean = git-lfs clean -- %f
+	smudge = git-lfs smudge -- %f
+	process = git-lfs filter-process
+	required = true
+[gpg "ssh"]
+	program = ssh-keygen
+	allowedSignersFile = 
+[column]
+	ui = auto
+[branch]
+	sort = -committerdate
+[push]
+	autoSetupRemote = true
+[fetch]
+	prune = true
+	all = true
+
+[include]
+	path = ~/.config/git/local.gitconfig

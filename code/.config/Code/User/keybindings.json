@@ -1,0 +1,27 @@
+// Place your key bindings in this file to override the defaultsauto[]
+[
+  {
+    "key": "ctrl+alt+n",
+    "command": "-extension.advancedNewFile"
+  },
+  {
+    "key": "ctrl+n",
+    "command": "create.new"
+  },
+  {
+    "key": "ctrl+alt+o",
+    "command": "-create.new"
+  },
+  {
+    "key": "ctrl+shift+n",
+    "command": "create.newFromCurrent"
+  },
+  {
+    "key": "ctrl+shift+alt+o",
+    "command": "-create.newFromCurrent"
+  },
+  {
+    "key": "ctrl+[Backslash]",
+    "command": "workbench.action.splitEditor"
+  }
+]
