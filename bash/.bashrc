@@ -115,7 +115,17 @@ if ! shopt -oq posix; then
     fi
 fi
 
-source ~/.config/zsh/local/.zshrc
+# Machine-local values (secrets, client paths) are shared with zsh; see
+# ~/.config/zsh/local.d. Optional, so this file also works on a machine with
+# no overlay at all — a container, for instance — which means anything in
+# local.d has to stay bash-compatible.
+#
+# host.d is deliberately not sourced here: those layers may hold zsh-specific
+# setup, such as the zsh direnv hook.
+for _bashrc_layer in ~/.config/zsh/local.d/*.zsh; do
+    [ -r "$_bashrc_layer" ] && . "$_bashrc_layer"
+done
+unset _bashrc_layer
 
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"                   # This loads nvm
