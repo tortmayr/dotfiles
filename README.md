@@ -98,7 +98,8 @@ through `sh -c`.
 ## Known consumers
 
 - [`tortmayr/dev-xp`](https://github.com/tortmayr/dev-xp) — workstation
-  overlay, adds this repository as a submodule at `core/`.
+  overlay, adds this repository as a submodule at `dotfiles/`, with its own
+  host-specific packages alongside in `dotfiles-host/`.
 - [`tortmayr/enclave-extensions`](https://github.com/tortmayr/enclave-extensions)
   — the `shell-ext` enclave feature, which installs the `container` profile
   into an agent container image and ships its own `host.d` layer.
